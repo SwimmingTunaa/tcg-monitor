@@ -1,0 +1,19 @@
+[Unit]
+Description=TCG Stock Monitor — Discord Restock Alerts
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tcg-monitor
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
