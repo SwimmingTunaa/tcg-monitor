@@ -14,12 +14,18 @@ the #journey-together set channel AND the #amazon-au retailer channel.
 # ─── Per-retailer channels ───────────────────────────────────────────
 # These fire for ANY product restock at that retailer
 RETAILER_WEBHOOKS = {
-    "amazon_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
+    "amazon_au": "https://discord.com/api/webhooks/1477637680450769067/JZhSZYVMr4rpaGgCsZGClb1cr9B_-MlRrte-k9-Db8RScrpjYvkWBY2euDhbIk76Lzpn",
     "ebgames_au": "https://discord.com/api/webhooks/1477634852202348787/lLWL8FW88wqtse7w4-gUkZfS5KMpI2x7I08hn9ablFGH5D25wVkduzG1SxpcOJR2jybH",
-    "jbhifi_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
-    "bigw_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
+    "jbhifi_au": "hhttps://discord.com/api/webhooks/1477637926031593564/KJU3LkBhZ0qTDJgNFbdxKtlY78ZsKUIItFtM-FaXTbbg0dmBx5aGDIAJQAwIBVJCy2-A",
+    "bigw_au": "https://discord.com/api/webhooks/1477638209159565423/stJkSYWzdcj9ungboyx_OgvUvhcZqHcmMns_WC9_v4TmAlCEpnI__So7lVjnQouzxeJr",
     "kmart_au": "https://discord.com/api/webhooks/1477637245702901832/SvoC1yxoIu-DSqzB2LERQg48ozu6niFYNZcfBSvVkpYwNk_xRRx2bsYHABmGDtuMYA52",
-    "target_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
+    "target_au": "https://discord.com/api/webhooks/1477637518253097082/44CQ29sIPm4ozqBeajd7jFjzwBvW171XxzbEu2LMsKsIWSMeNEdrz9dlGcBSQ93c6Fxf",
+    "myer_au": "https://discord.com/api/webhooks/1477638219997774020/LKsm9mkQXd8WQuqZPVeDcg9W4fQSh6OqJOPSB0LMyOTLlPMmMa3oE7vjWmGkEa5AsBr6",
+    "toymate_au": "https://discord.com/api/webhooks/1477639125128577197/v_GNnUnepsV2zEsoBTr3SIR14sESF6c7HVWVHxezYJrXuCQUfC-ynSi2sTUZ3TQ8QW9x",
+    "costco_au": "https://discord.com/api/webhooks/1477639111878643824/lm5LsGstZFarP-FosNbN6Uv_M0CnTRYSFsoYdYAxxzTWxLO0deH9Jj8Or41wbezzIwg0",
+    "pokemon_centre_au": "https://discord.com/api/webhooks/1477639126139408516/BCoNcTSkMoFuG0abdJMpvxtxf9hNYx1rhyWX1om58K5MVLBoWOydSs6e0H8fDAICoJrX",
+    "mrtoys_au": "https://discord.com/api/webhooks/1477639126668021872/lcawXu0IzcZI2FxfDiAGtxI6XWykunBVqDT71-INrbqFnSxPr4Fh4F-NusLjO5lqyZoj",
+
 }
 
 # ─── Per-set channels ────────────────────────────────────────────────
