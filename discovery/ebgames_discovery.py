@@ -25,6 +25,13 @@ import time
 import logging
 import argparse
 import requests
+
+# Load .env file from project root
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass  # dotenv not installed, rely on environment variables
 from bs4 import BeautifulSoup
 from datetime import datetime
 from typing import Optional
@@ -56,20 +63,20 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # Add/remove categories as needed
 EB_CATEGORY_URLS = {
     "pokemon": [
-        "https://www.ebgames.com.au/category/trading-cards?q=pokemon",
-        "https://www.ebgames.com.au/category/toys-and-collectibles?q=pokemon+tcg",
+        "https://www.ebgames.com.au/featured/pokemon-trading-card-game",
+        "https://www.ebgames.com.au/featured/trading-cards",
     ],
     "one-piece": [
-        "https://www.ebgames.com.au/category/trading-cards?q=one+piece",
+        "https://www.ebgames.com.au/featured/trading-cards",
     ],
     "mtg": [
-        "https://www.ebgames.com.au/category/trading-cards?q=magic+gathering",
+        "https://www.ebgames.com.au/featured/trading-cards",
     ],
     "dragon-ball-z": [
-        "https://www.ebgames.com.au/category/trading-cards?q=dragon+ball",
+        "https://www.ebgames.com.au/featured/trading-cards",
     ],
     "lorcana": [
-        "https://www.ebgames.com.au/category/trading-cards?q=lorcana",
+        "https://www.ebgames.com.au/featured/trading-cards",
     ],
 }
 
@@ -85,6 +92,52 @@ TCG_KEYWORDS = {
     "dragon-ball-z": ["dragon ball", "dbz"],
     "lorcana": ["lorcana"],
 }
+
+# Product types we WANT to track (must match at least one)
+PRODUCT_ALLOWLIST = [
+    "booster box",
+    "booster bundle",
+    "booster pack",
+    "booster",
+    "elite trainer box",
+    "etb",
+    "collection box",
+    "premium collection",
+    "tin",
+    "blister",
+    "starter deck",
+    "theme deck",
+    "build & battle",
+    "trainer kit",
+    "league battle deck",
+    "knock out collection",
+]
+
+# Product types we NEVER want to track
+PRODUCT_BLOCKLIST = [
+    "portfolio",
+    "binder",
+    "card sleeve",
+    "sleeves",
+    "deck box",
+    "playmat",
+    "card case",
+    "display case",
+    "storage box",
+    "mini portfolio",
+    "9-pocket",
+    "4-pocket",
+    "card divider",
+    "damage counter",
+    "coin",
+    "dice",
+    "figure",
+    "plush",
+    "squishmallow",
+    "t-shirt",
+    "poster",
+    "card game mat",
+]
 
 # Product types to capture (helps with set inference)
 PRODUCT_TYPES = [
@@ -269,6 +322,109 @@ def infer_product_type(name: str) -> str:
     return "Product"
 
 
+def fetch_product_image(url: str) -> Optional[str]:
+    """
+    Fetch a product page and extract its image URL.
+
+    EB Games renders images via JS so og:image is often missing.
+    We try multiple sources in order of reliability:
+      1. __NEXT_DATA__ JSON blob (Next.js SSR data, always present)
+      2. JSON-LD structured data
+      3. og:image meta tag
+      4. Any img tag with a CDN URL
+    """
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # ── 1. Next.js __NEXT_DATA__ (most reliable for EB Games) ────
+        next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+        if next_data_tag and next_data_tag.string:
+            try:
+                next_data = json.loads(next_data_tag.string)
+                # Walk the props tree to find image URLs
+                # Path varies but images are usually in props.pageProps.product
+                props = next_data.get("props", {})
+                page_props = props.get("pageProps", {})
+                product = page_props.get("product", page_props.get("data", {}))
+
+                # Try common image field names
+                for field in ("imageUrl", "image", "images", "primaryImage", "thumbnail"):
+                    val = product.get(field)
+                    if isinstance(val, str) and val.startswith("http"):
+                        return val
+                    if isinstance(val, list) and val:
+                        first = val[0]
+                        if isinstance(first, str) and first.startswith("http"):
+                            return first
+                        if isinstance(first, dict):
+                            for k in ("url", "src", "href"):
+                                if first.get(k, "").startswith("http"):
+                                    return first[k]
+
+                # Broader search: find any CDN image URL in the JSON
+                raw_json = next_data_tag.string
+                cdn_matches = re.findall(
+                    r'https://[^"]+(?:ebgames|scene7|cloudinary|cdn)[^"]+\.(?:jpg|jpeg|png|webp)',
+                    raw_json, re.I
+                )
+                if cdn_matches:
+                    return cdn_matches[0]
+
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # ── 2. JSON-LD structured data ───────────────────────────────
+        for script in soup.find_all("script", {"type": "application/ld+json"}):
+            try:
+                data = json.loads(script.string or "")
+                items = [data] if isinstance(data, dict) else data
+                for item in items:
+                    if item.get("@type") == "Product":
+                        img = item.get("image")
+                        if isinstance(img, str) and img.startswith("http"):
+                            return img
+                        if isinstance(img, list) and img:
+                            return img[0]
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # ── 3. <link itemprop="image"> — schema.org microdata ────────
+        link_img = soup.find("link", {"itemprop": "image"})
+        if link_img and link_img.get("href"):
+            href = link_img["href"]
+            if href.startswith("//"):
+                href = "https:" + href
+            return href
+
+        # ── 4. <img class="gallery-img"> — product gallery image ──────
+        gallery_img = soup.find("img", class_="gallery-img")
+        if gallery_img and gallery_img.get("src"):
+            src = gallery_img["src"]
+            if src.startswith("//"):
+                src = "https:" + src
+            return src
+
+        # ── 5. og:image meta tag ─────────────────────────────────────
+        og_img = soup.find("meta", property="og:image")
+        if og_img and og_img.get("content"):
+            return og_img["content"]
+
+        # ── 6. Any img tag pointing to EB CDN ────────────────────────
+        for img in soup.find_all("img", src=True):
+            src = img["src"]
+            if "eb-cdn.com.au" in src and any(ext in src.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                if src.startswith("//"):
+                    src = "https:" + src
+                return src
+
+    except Exception as e:
+        logger.debug(f"  Could not fetch image for {url}: {e}")
+
+    return None
+
+
 def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
     """
     Take a raw product dict from Claude and enrich it with
@@ -293,6 +449,20 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
     if "/product/" not in url:
         return None
 
+    # Filter by product type
+    name_lower = name.lower()
+
+    # Blocklist check — skip accessories, storage, merch
+    for blocked in PRODUCT_BLOCKLIST:
+        if blocked in name_lower:
+            logger.debug(f"  Skipping (blocklisted '{blocked}'): {name}")
+            return None
+
+    # Allowlist check — must be a card product we care about
+    if not any(allowed in name_lower for allowed in PRODUCT_ALLOWLIST):
+        logger.debug(f"  Skipping (not in allowlist): {name}")
+        return None
+
     set_key = infer_set(name) if tcg == "pokemon" else None
 
     return {
@@ -301,7 +471,7 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
         "set": set_key or tcg,
         "tcg": tcg,
         "retailer": "ebgames_au",
-        "image": "",
+        "image": "",  # Filled in by fetch_product_image later
         "discovered_at": datetime.now().isoformat(),
         "source": "ai_discovery",
     }
@@ -333,6 +503,7 @@ def save_new_products(products: list[dict], db: "Database") -> tuple[int, int]:
             name=product["name"],
             retailer=product["retailer"],
             in_stock=False,
+            image_url=product.get("image") or None,
             status_changed=False,
         )
         added += 1
@@ -349,13 +520,14 @@ def update_products_config(products: list[dict], dry_run: bool = False) -> str:
     lines = []
     for p in products:
         set_val = f'"{p["set"]}"' if p.get("set") else "None"
+        image_val = p.get("image", "")
         lines.append(f"""    {{
         "url": "{p["url"]}",
         "name": "{p["name"]}",
         "set": {set_val},
         "tcg": "{p["tcg"]}",
         "retailer": "ebgames_au",
-        "image": "",
+        "image": "{image_val}",
     }},""")
 
     return "\n".join(lines)
@@ -419,6 +591,19 @@ def discover_ebgames(tcg_filter: Optional[str] = None, dry_run: bool = False) ->
             # Be polite between requests
             time.sleep(2)
 
+    # Step 5: Fetch images for all discovered products
+    if all_products:
+        logger.info(f"🖼️  Fetching images for {len(all_products)} products...")
+        for product in all_products:
+            image_url = fetch_product_image(product["url"])
+            if image_url:
+                product["image"] = image_url
+                logger.info(f"  ✅ {product['name'][:50]}")
+            else:
+                logger.info(f"  ⚠️  No image: {product['name'][:50]}")
+            time.sleep(1)  # Be polite between product page fetches
+        logger.info("")
+
         logger.info("")
 
     logger.info(f"📦 Total unique products found: {len(all_products)}")
@@ -429,8 +614,11 @@ def discover_ebgames(tcg_filter: Optional[str] = None, dry_run: bool = False) ->
         logger.info("── DRY RUN — Products that would be added ─────")
         for p in all_products:
             set_label = f" [{p['set']}]" if p.get("set") else ""
-            logger.info(f"  {p['name']}{set_label}")
+            image_label = " 🖼️" if p.get("image") else " (no image)"
+            logger.info(f"  {p['name']}{set_label}{image_label}")
             logger.info(f"    {p['url']}")
+            if p.get("image"):
+                logger.info(f"    {p['image']}")
         logger.info("")
         logger.info("── Config entries (copy to config/products.py) ─")
         print(update_products_config(all_products))
