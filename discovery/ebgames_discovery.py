@@ -1,20 +1,30 @@
 """
-EB Games AU — AI-Powered Product Discovery
-==========================================
-Automatically discovers TCG product URLs from EB Games AU category pages
-using Claude API (Haiku) to extract product listings from HTML.
+EB Games AU — Product Discovery
+=================================
+Discovers TCG product URLs from EB Games AU category pages.
 
-Runs as a weekly job. Found products are saved to the database and
-automatically picked up by the monitor on the next cycle.
+Strategy (three-pass):
+  1. Parse raw HTML with BeautifulSoup — EB Games server-side renders
+     product tiles with data-sku, data-name, data-price attributes.
+     Fast but often blocked by Cloudflare bot detection.
+  2. Playwright with persistent context — uses a stored browser profile
+     (cookies, fingerprint) so Cloudflare remembers us as a real browser.
+     First run must be --headed to pass the challenge visually.
+  3. Falls back to parsing the raw DOM HTML if JS hydration doesn't fire.
 
 Usage:
-    python discovery/ebgames_discovery.py              # Discover all TCG products
-    python discovery/ebgames_discovery.py --dry-run    # Print found products, don't save
-    python discovery/ebgames_discovery.py --tcg pokemon # Only discover Pokémon products
+    # First run: use headed mode to pass Cloudflare challenge once
+    python discovery/ebgames_discovery.py --tcg pokemon --dry-run --headed
+
+    # Subsequent runs: headless works using saved cookies
+    python discovery/ebgames_discovery.py --tcg pokemon --dry-run
+
+    # Skip image fetching for speed
+    python discovery/ebgames_discovery.py --tcg pokemon --dry-run --no-images
 
 Setup:
-    pip install anthropic
-    Set ANTHROPIC_API_KEY in your environment or .env file
+    pip install playwright beautifulsoup4 lxml
+    playwright install chromium
 """
 
 import os
@@ -24,30 +34,30 @@ import json
 import time
 import logging
 import argparse
+from datetime import datetime
+from typing import Optional
+
 import requests
+from bs4 import BeautifulSoup
 
 # Load .env file from project root
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 except ImportError:
-    pass  # dotenv not installed, rely on environment variables
-from bs4 import BeautifulSoup
-from datetime import datetime
-from typing import Optional
+    pass
 
-# Add project root to path so we can import from config/utils
+# Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
-    import anthropic
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    print("❌ Missing dependency: pip install anthropic")
-    sys.exit(1)
+    PLAYWRIGHT_AVAILABLE = False
 
 try:
     from utils.database import Database
-    from utils.helpers import get_random_headers, RETAILER_NAMES
     from canonical.matcher import match_product
     DB_AVAILABLE = True
 except ImportError:
@@ -59,10 +69,10 @@ logger = logging.getLogger(__name__)
 
 # ─── Configuration ───────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Persistent browser profile directory (survives between runs)
+BROWSER_PROFILE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "browser_profile")
 
-# EB Games category pages to crawl
-# Add/remove categories as needed
+# EB Games category pages per TCG
 EB_CATEGORY_URLS = {
     "pokemon": [
         "https://www.ebgames.com.au/featured/pokemon-trading-card-game",
@@ -82,20 +92,16 @@ EB_CATEGORY_URLS = {
     ],
 }
 
-# TCG keywords to identify relevant products
-TCG_KEYWORDS = {
-    "pokemon": [
-        "pokemon", "pokémon", "pikachu", "charizard",
-        "booster", "elite trainer", "etb", "collection box",
-        "tin", "blister", "bundle",
-    ],
+# Keywords that must appear in the product name for each TCG
+TCG_NAME_KEYWORDS = {
+    "pokemon": ["pokemon"],
     "one-piece": ["one piece", "op-"],
-    "mtg": ["magic: the gathering", "magic gathering", "commander", "draft booster"],
+    "mtg": ["magic: the gathering", "magic gathering", "commander"],
     "dragon-ball-z": ["dragon ball", "dbz"],
     "lorcana": ["lorcana"],
 }
 
-# Product types we WANT to track (must match at least one)
+# Product types we WANT to track
 PRODUCT_ALLOWLIST = [
     "booster box",
     "booster bundle",
@@ -115,7 +121,7 @@ PRODUCT_ALLOWLIST = [
     "knock out collection",
 ]
 
-# Product types we NEVER want to track
+# Product types to skip
 PRODUCT_BLOCKLIST = [
     "portfolio",
     "binder",
@@ -139,16 +145,18 @@ PRODUCT_BLOCKLIST = [
     "t-shirt",
     "poster",
     "card game mat",
-]
-
-# Product types to capture (helps with set inference)
-PRODUCT_TYPES = [
-    "elite trainer box", "etb",
-    "booster box", "booster bundle", "booster pack",
-    "collection box", "collection",
-    "tin", "blister",
-    "starter deck", "theme deck",
-    "premium collection",
+    "checklane",
+    "jersey",
+    "hoodie",
+    "cap",
+    "hat",
+    "backpack",
+    "bag",
+    "wallet",
+    "keychain",
+    "lanyard",
+    "mug",
+    "water bottle",
 ]
 
 # Known Pokémon sets for auto-tagging
@@ -167,144 +175,345 @@ POKEMON_SETS = {
     "mega evolution": "mega-evolutions",
 }
 
-HEADERS = {
+# Headers for raw HTTP requests
+REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-AU,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
 }
 
 
-# ─── HTML Fetching ───────────────────────────────────────────────────
+# ─── HTML Parsing (shared by all strategies) ─────────────────────────
 
-def fetch_category_page(url: str) -> Optional[str]:
-    """Fetch an EB Games category page and return the raw HTML."""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        logger.info(f"  Fetched {url} ({len(resp.text):,} chars)")
-        return resp.text
-    except Exception as e:
-        logger.error(f"  Failed to fetch {url}: {e}")
-        return None
-
-
-def extract_product_listing_html(html: str) -> str:
+def parse_products_from_html(html: str) -> list[dict]:
     """
-    Strip down the full page HTML to just the product listing area.
-    This reduces token usage significantly before sending to Claude.
+    Parse product tiles from HTML using BeautifulSoup.
+
+    EB Games server-side renders product tiles as:
+        <div class="product-tile ..." data-sku="339236"
+             data-name="Pokemon - TCG - ..." data-price="115" ...>
+            <a href="/product/..." class="product-link details" ...>
+                <img class="packshot-image" src="//c1-ebgames.eb-cdn.com.au/..." ...>
+                <div class="release-date-info">...</div>  (if preorder)
+            </a>
+        </div>
+
+    Skeleton placeholders lack data-sku and have class "skeleton-loader".
     """
     soup = BeautifulSoup(html, "lxml")
+    tiles = soup.select(".product-tile[data-sku]")
 
-    # Remove noise: nav, footer, scripts, styles, ads
-    for tag in soup(["script", "style", "nav", "footer", "header",
-                      "aside", "iframe", "noscript"]):
-        tag.decompose()
+    seen = set()
+    products = []
 
-    # Try to find the product grid/listing container
-    # EB Games typically uses a product grid with these classes
-    product_container = (
-        soup.find("div", class_=re.compile(r"product.?grid|product.?list|search.?results|category.?products", re.I))
-        or soup.find("ul", class_=re.compile(r"product", re.I))
-        or soup.find("main")
-        or soup.find("div", {"id": re.compile(r"main|content|products", re.I)})
-    )
+    for tile in tiles:
+        name = tile.get("data-name", "").strip()
+        price_raw = tile.get("data-price", "")
+        sku = tile.get("data-sku", "")
 
-    if product_container:
-        text = product_container.get_text(separator="\n", strip=True)
-    else:
-        # Fallback: use full page text but truncate
-        text = soup.get_text(separator="\n", strip=True)
+        # Get product link
+        link = tile.select_one('a.product-link[href*="/product/"]')
+        if not link:
+            continue
+        href = link.get("href", "")
+        if not href:
+            continue
+        if href.startswith("/"):
+            href = "https://www.ebgames.com.au" + href
 
-    # Also extract all anchor tags with hrefs (to catch product links)
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/product/" in href:
-            name = a.get_text(strip=True)
-            if name and len(name) > 5:
-                links.append(f"{name} → {href}")
+        if href in seen:
+            continue
+        seen.add(href)
 
-    # Combine: text content + extracted links
-    combined = f"=== PAGE TEXT ===\n{text[:8000]}\n\n=== PRODUCT LINKS FOUND ===\n"
-    combined += "\n".join(links[:100])  # Cap at 100 links
+        # Get product image (skip skeleton SVG placeholders)
+        image_url = ""
+        img = tile.select_one("img.packshot-image")
+        if img:
+            src = img.get("src", "")
+            if src and not src.startswith("data:"):
+                image_url = "https:" + src if src.startswith("//") else src
 
-    return combined
+        # Check for preorder
+        is_preorder = bool(tile.select_one(".release-date-info, .icon-preorder"))
+
+        # Get promo badge
+        promo_badge = tile.select_one(".promo-badge")
+        promo = promo_badge.get_text(strip=True) if promo_badge else ""
+
+        if name and href:
+            try:
+                price_num = float(price_raw)
+            except (ValueError, TypeError):
+                price_num = None
+
+            products.append({
+                "name": name,
+                "url": href,
+                "price": f"${price_num:.2f}" if price_num else "",
+                "price_raw": price_num,
+                "sku": sku,
+                "image": image_url,
+                "is_preorder": is_preorder,
+                "promo": promo,
+            })
+
+    return products
 
 
-# ─── Claude AI Extraction ────────────────────────────────────────────
+# ─── Strategy 1: Raw HTTP (fast, often blocked by Cloudflare) ────────
 
-def extract_products_with_claude(page_content: str, tcg: str, category_url: str) -> list[dict]:
+def scrape_category_raw(url: str) -> list[dict]:
     """
-    Use Claude Haiku to extract TCG product listings from page content.
-    Returns a list of product dicts with url, name, tcg fields.
+    Fetch an EB Games category page via raw HTTP and parse product tiles.
+    Fast when it works, but Cloudflare usually blocks it.
     """
-    if not ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY not set. Get one at console.anthropic.com")
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    tcg_label = tcg.replace("-", " ").title()
-    keywords = ", ".join(TCG_KEYWORDS.get(tcg, [tcg]))
-
-    prompt = f"""You are extracting {tcg_label} TCG product listings from an EB Games Australia page.
-
-The page content below is from: {category_url}
-
-Your task:
-1. Find all {tcg_label} TCG products listed on this page
-2. For each product, extract:
-   - name: The full product name exactly as shown
-   - url: The product URL (make it absolute: prefix with https://www.ebgames.com.au if relative)
-3. Only include actual TCG products — ignore accessories, consoles, games, etc.
-4. Keywords that indicate a relevant product: {keywords}
-
-Return ONLY a JSON array. No explanation, no markdown, just raw JSON like:
-[
-  {{"name": "Pokémon TCG: Journey Together Elite Trainer Box", "url": "https://www.ebgames.com.au/product/..."}},
-  {{"name": "Pokémon TCG: Surging Sparks Booster Bundle", "url": "https://www.ebgames.com.au/product/..."}}
-]
-
-If no products found, return: []
-
-PAGE CONTENT:
-{page_content}"""
-
     try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.debug(f"  Raw fetch failed: {e}")
+        return []
+
+    products = parse_products_from_html(resp.text)
+    return products
+
+
+# ─── Strategy 2: Playwright with persistent context ──────────────────
+
+STEALTH_JS = """
+() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-AU', 'en'] });
+    delete window.__playwright;
+    delete window.__pw_manual;
+}
+"""
+
+SCROLL_JS = """
+async () => {
+    let last = 0;
+    for (let i = 0; i < 20; i++) {
+        window.scrollBy(0, 800);
+        await new Promise(r => setTimeout(r, 400));
+        if (document.body.scrollHeight === last && i > 3) break;
+        last = document.body.scrollHeight;
+    }
+    return document.body.scrollHeight;
+}
+"""
+
+EXTRACT_JS = """
+() => {
+    const seen = new Set();
+    const products = [];
+
+    document.querySelectorAll('.product-tile[data-sku]').forEach(tile => {
+        const name = tile.getAttribute('data-name') || '';
+        const price = tile.getAttribute('data-price') || '';
+        const sku = tile.getAttribute('data-sku') || '';
+
+        const link = tile.querySelector('a.product-link[href*="/product/"]');
+        const href = link ? link.href : '';
+        if (!href || seen.has(href)) return;
+        seen.add(href);
+
+        const img = tile.querySelector('img.packshot-image:not(.skeleton-loader)');
+        const imageUrl = img ? (img.getAttribute('src') || '') : '';
+
+        const preorderEl = tile.querySelector('.release-date-info, .icon-preorder');
+        const isPreorder = !!preorderEl;
+
+        const promoBadge = tile.querySelector('.promo-badge');
+        const promoText = promoBadge ? promoBadge.textContent.trim() : '';
+
+        if (name && href) {
+            const priceNum = parseFloat(price) || null;
+            products.push({
+                name: name,
+                url: href,
+                price: priceNum ? ('$' + priceNum.toFixed(2)) : '',
+                price_raw: priceNum,
+                sku: sku,
+                image: imageUrl.startsWith('//') ? ('https:' + imageUrl) : imageUrl,
+                is_preorder: isPreorder,
+                promo: promoText,
+            });
+        }
+    });
+
+    return products;
+}
+"""
+
+
+def scrape_category_playwright(url: str, headed: bool = False) -> list[dict]:
+    """
+    Use Playwright with a persistent browser context to scrape EB Games.
+
+    The persistent context stores cookies/localStorage between runs.
+    On first run, use --headed so you can see (and pass) the Cloudflare
+    challenge. After that, headless runs reuse the saved cookies.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.warning("  Playwright not available")
+        return []
+
+    profile_dir = os.path.abspath(BROWSER_PROFILE_DIR)
+    os.makedirs(profile_dir, exist_ok=True)
+
+    with sync_playwright() as p:
+        # launch_persistent_context gives us a real browser profile
+        # that persists cookies, localStorage, etc. across runs
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=not headed,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-AU",
+            viewport={"width": 1280, "height": 900},
         )
 
-        raw = message.content[0].text.strip()
+        # Inject stealth patches before navigation
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
 
-        # Strip markdown code fences if present
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+        try:
+            mode = "headed" if headed else "headless"
+            logger.info(f"  [{mode}] Loading: {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        products = json.loads(raw)
+            # If headed, give user time to solve any Cloudflare challenge
+            if headed:
+                logger.info(f"  [headed] Waiting for page to fully load (solve any challenges)...")
+                try:
+                    page.wait_for_selector('.product-tile[data-sku]', timeout=60000)
+                except PlaywrightTimeout:
+                    logger.info(f"  [headed] Still waiting — trying DOM parse...")
+            else:
+                # Headless: wait for tiles to appear
+                try:
+                    page.wait_for_selector('.product-tile[data-sku]', timeout=15000)
+                except PlaywrightTimeout:
+                    pass  # Will try DOM parse below
 
-        if not isinstance(products, list):
-            logger.warning("Claude returned non-list response")
+            # Extra wait for hydration
+            page.wait_for_timeout(2000)
+
+            # Scroll to trigger lazy-loaded carousels
+            logger.info(f"  Scrolling to load all products...")
+            page.evaluate(SCROLL_JS)
+            page.wait_for_timeout(2000)
+
+            # Try JS extraction first (works if tiles are hydrated in DOM)
+            products = page.evaluate(EXTRACT_JS)
+            if products:
+                logger.info(f"  Found {len(products)} products via JS extraction")
+                return products
+
+            # Fallback: parse the raw HTML that Playwright received
+            logger.info(f"  JS extraction found 0 — trying raw HTML parse of Playwright DOM...")
+            html = page.content()
+            products = parse_products_from_html(html)
+            if products:
+                logger.info(f"  Found {len(products)} products via DOM HTML parse")
+                return products
+
+            logger.warning(f"  No products found on {url}")
             return []
 
-        logger.info(f"  Claude found {len(products)} products")
-        return products
-
-    except json.JSONDecodeError as e:
-        logger.error(f"  Claude returned invalid JSON: {e}")
-        logger.debug(f"  Raw response: {raw[:500]}")
-        return []
-    except Exception as e:
-        logger.error(f"  Claude API error: {e}")
-        return []
+        except Exception as e:
+            logger.error(f"  Playwright error on {url}: {e}")
+            return []
+        finally:
+            page.close()
+            context.close()
 
 
-# ─── Product Enrichment ──────────────────────────────────────────────
+# ─── Combined Scraping ───────────────────────────────────────────────
+
+def scrape_category_page(url: str, tcg: str, headed: bool = False) -> list[dict]:
+    """
+    Scrape an EB Games category page for product data.
+
+    Strategy:
+      1. Try raw HTTP + BeautifulSoup (fast, no JS needed)
+      2. If that fails, use Playwright with persistent context
+    """
+    # Strategy 1: raw HTML (skip if we know it'll fail — e.g. previous 403)
+    if not headed:
+        logger.info(f"  Loading (raw): {url}")
+        products = scrape_category_raw(url)
+        if products:
+            logger.info(f"  ✅ Found {len(products)} products via raw HTML")
+            return products
+        logger.info(f"  Raw HTML had no products — falling back to Playwright")
+
+    # Strategy 2: Playwright with persistent context
+    products = scrape_category_playwright(url, headed=headed)
+    return products
+
+
+def fetch_product_image_playwright(url: str) -> Optional[str]:
+    """
+    Use Playwright to fetch a product page and extract its image URL.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
+
+    profile_dir = os.path.abspath(BROWSER_PROFILE_DIR)
+    os.makedirs(profile_dir, exist_ok=True)
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+        )
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+            image_url = page.evaluate("""
+                () => {
+                    const og = document.querySelector('meta[property="og:image"]');
+                    if (og && og.content) return og.content;
+                    const img = document.querySelector('img[src*="eb-cdn"], img[src*="scene7"]');
+                    if (img) return img.src.startsWith('//') ? 'https:' + img.src : img.src;
+                    return null;
+                }
+            """)
+            return image_url
+        except Exception as e:
+            logger.debug(f"  Image fetch failed for {url}: {e}")
+            return None
+        finally:
+            page.close()
+            context.close()
+
+
+# ─── Product Filtering & Enrichment ─────────────────────────────────
 
 def infer_set(name: str) -> Optional[str]:
     """Try to infer the TCG set from the product name."""
@@ -315,154 +524,51 @@ def infer_set(name: str) -> Optional[str]:
     return None
 
 
-def infer_product_type(name: str) -> str:
-    """Infer product type from name for display purposes."""
-    name_lower = name.lower()
-    for pt in PRODUCT_TYPES:
-        if pt in name_lower:
-            return pt.title()
-    return "Product"
-
-
-def fetch_product_image(url: str) -> Optional[str]:
-    """
-    Fetch a product page and extract its image URL.
-
-    EB Games renders images via JS so og:image is often missing.
-    We try multiple sources in order of reliability:
-      1. __NEXT_DATA__ JSON blob (Next.js SSR data, always present)
-      2. JSON-LD structured data
-      3. og:image meta tag
-      4. Any img tag with a CDN URL
-    """
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # ── 1. Next.js __NEXT_DATA__ (most reliable for EB Games) ────
-        next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-        if next_data_tag and next_data_tag.string:
-            try:
-                next_data = json.loads(next_data_tag.string)
-                # Walk the props tree to find image URLs
-                # Path varies but images are usually in props.pageProps.product
-                props = next_data.get("props", {})
-                page_props = props.get("pageProps", {})
-                product = page_props.get("product", page_props.get("data", {}))
-
-                # Try common image field names
-                for field in ("imageUrl", "image", "images", "primaryImage", "thumbnail"):
-                    val = product.get(field)
-                    if isinstance(val, str) and val.startswith("http"):
-                        return val
-                    if isinstance(val, list) and val:
-                        first = val[0]
-                        if isinstance(first, str) and first.startswith("http"):
-                            return first
-                        if isinstance(first, dict):
-                            for k in ("url", "src", "href"):
-                                if first.get(k, "").startswith("http"):
-                                    return first[k]
-
-                # Broader search: find any CDN image URL in the JSON
-                raw_json = next_data_tag.string
-                cdn_matches = re.findall(
-                    r'https://[^"]+(?:ebgames|scene7|cloudinary|cdn)[^"]+\.(?:jpg|jpeg|png|webp)',
-                    raw_json, re.I
-                )
-                if cdn_matches:
-                    return cdn_matches[0]
-
-            except (json.JSONDecodeError, AttributeError):
-                pass
-
-        # ── 2. JSON-LD structured data ───────────────────────────────
-        for script in soup.find_all("script", {"type": "application/ld+json"}):
-            try:
-                data = json.loads(script.string or "")
-                items = [data] if isinstance(data, dict) else data
-                for item in items:
-                    if item.get("@type") == "Product":
-                        img = item.get("image")
-                        if isinstance(img, str) and img.startswith("http"):
-                            return img
-                        if isinstance(img, list) and img:
-                            return img[0]
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        # ── 3. <link itemprop="image"> — schema.org microdata ────────
-        link_img = soup.find("link", {"itemprop": "image"})
-        if link_img and link_img.get("href"):
-            href = link_img["href"]
-            if href.startswith("//"):
-                href = "https:" + href
-            return href
-
-        # ── 4. <img class="gallery-img"> — product gallery image ──────
-        gallery_img = soup.find("img", class_="gallery-img")
-        if gallery_img and gallery_img.get("src"):
-            src = gallery_img["src"]
-            if src.startswith("//"):
-                src = "https:" + src
-            return src
-
-        # ── 5. og:image meta tag ─────────────────────────────────────
-        og_img = soup.find("meta", property="og:image")
-        if og_img and og_img.get("content"):
-            return og_img["content"]
-
-        # ── 6. Any img tag pointing to EB CDN ────────────────────────
-        for img in soup.find_all("img", src=True):
-            src = img["src"]
-            if "eb-cdn.com.au" in src and any(ext in src.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                if src.startswith("//"):
-                    src = "https:" + src
-                return src
-
-    except Exception as e:
-        logger.debug(f"  Could not fetch image for {url}: {e}")
-
+def parse_price(price_str: str) -> Optional[float]:
+    """Parse '$59.00' → 59.0"""
+    if not price_str:
+        return None
+    match = re.search(r"\$?([\d,]+\.?\d*)", price_str)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            pass
     return None
 
 
 def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
-    """
-    Take a raw product dict from Claude and enrich it with
-    set info, retailer key, and other metadata.
-    Returns None if the product doesn't look valid.
-    """
+    """Filter and enrich a raw product dict. Returns None if it should be skipped."""
     name = raw.get("name", "").strip()
     url = raw.get("url", "").strip()
 
     if not name or not url:
         return None
-
-    # Ensure URL is absolute
-    if url.startswith("/"):
-        url = f"https://www.ebgames.com.au{url}"
-
-    # Must be an EB Games URL
-    if "ebgames.com.au" not in url:
+    if "ebgames.com.au" not in url or "/product/" not in url:
         return None
 
-    # Must have /product/ in URL (actual product page, not category)
-    if "/product/" not in url:
+    # Only allow TCG-relevant product categories (blocks clothing, homewares, etc.)
+    ALLOWED_URL_PATHS = ["/product/toys-and-collectibles/", "/product/trading-cards/"]
+    if not any(path in url for path in ALLOWED_URL_PATHS):
+        logger.debug(f"  Wrong category: {url}")
         return None
 
-    # Filter by product type
     name_lower = name.lower()
 
-    # Blocklist check — skip accessories, storage, merch
+    # Must match the TCG keywords
+    keywords = TCG_NAME_KEYWORDS.get(tcg, [tcg.lower()])
+    if not any(kw in name_lower for kw in keywords):
+        return None
+
+    # Blocklist check
     for blocked in PRODUCT_BLOCKLIST:
         if blocked in name_lower:
-            logger.debug(f"  Skipping (blocklisted '{blocked}'): {name}")
+            logger.debug(f"  Blocked '{blocked}': {name}")
             return None
 
-    # Allowlist check — must be a card product we care about
+    # Allowlist check
     if not any(allowed in name_lower for allowed in PRODUCT_ALLOWLIST):
-        logger.debug(f"  Skipping (not in allowlist): {name}")
+        logger.debug(f"  Not in allowlist: {name}")
         return None
 
     set_key = infer_set(name) if tcg == "pokemon" else None
@@ -473,43 +579,41 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
         "set": set_key or tcg,
         "tcg": tcg,
         "retailer": "ebgames_au",
-        "image": "",  # Filled in by fetch_product_image later
+        "price": raw.get("price_raw") or parse_price(raw.get("price", "")),
+        "price_str": raw.get("price", "") or None,
+        "image": raw.get("image", "") or "",
+        "sku": raw.get("sku", ""),
+        "is_preorder": raw.get("is_preorder", False),
         "discovered_at": datetime.now().isoformat(),
-        "source": "ai_discovery",
+        "source": "playwright_discovery",
     }
 
 
 # ─── Database Integration ────────────────────────────────────────────
 
 def save_new_products(products: list[dict], db: "Database") -> tuple[int, int]:
-    """
-    Save newly discovered products to the database.
-    Returns (added, skipped) counts.
-    """
+    """Save newly discovered products. Returns (added, skipped)."""
     added = 0
     skipped = 0
 
     for product in products:
         url = product["url"]
 
-        # Check if we already track this URL
-        existing = db.get_last_status(url)
-        if existing:
+        if db.get_last_status(url):
             skipped += 1
             continue
 
-        # Insert as a new product with unknown stock status
-        # The monitor will pick it up on the next cycle
         db.update_status(
             url=url,
             name=product["name"],
             retailer=product["retailer"],
             in_stock=False,
+            price=product.get("price"),
+            price_str=product.get("price_str"),
             image_url=product.get("image") or None,
             status_changed=False,
         )
 
-        # Attempt canonical matching
         if match_product:
             set_key = product.get("set") if product.get("tcg") == "pokemon" else None
             match = match_product(
@@ -518,7 +622,11 @@ def save_new_products(products: list[dict], db: "Database") -> tuple[int, int]:
                 set_key=set_key,
             )
             db.set_canonical_match(url, match["canonical_id"], match["status"])
-            match_label = f" → {match['canonical_id']} ({match['score']:.0%})" if match["canonical_id"] else f" (unmatched, {match['score']:.0%})"
+            match_label = (
+                f" → {match['canonical_id']} ({match['score']:.0%})"
+                if match["canonical_id"]
+                else f" (unmatched, {match['score']:.0%})"
+            )
             logger.info(f"  ✅ Added: {product['name']}{match_label}")
         else:
             logger.info(f"  ✅ Added: {product['name']}")
@@ -528,73 +636,52 @@ def save_new_products(products: list[dict], db: "Database") -> tuple[int, int]:
     return added, skipped
 
 
-def update_products_config(products: list[dict], dry_run: bool = False) -> str:
-    """
-    Generate the Python config entries for new products.
-    Used to update config/products.py with discovered products.
-    """
+def generate_config_entries(products: list[dict]) -> str:
+    """Generate config/products.py entries for discovered products."""
     lines = []
     for p in products:
         set_val = f'"{p["set"]}"' if p.get("set") else "None"
-        image_val = p.get("image", "")
         lines.append(f"""    {{
         "url": "{p["url"]}",
         "name": "{p["name"]}",
         "set": {set_val},
         "tcg": "{p["tcg"]}",
         "retailer": "ebgames_au",
-        "image": "{image_val}",
+        "image": "{p.get("image", "")}",
     }},""")
-
     return "\n".join(lines)
 
 
 # ─── Main Discovery Flow ─────────────────────────────────────────────
 
-def discover_ebgames(tcg_filter: Optional[str] = None, dry_run: bool = False) -> list[dict]:
+def discover_ebgames(tcg_filter: Optional[str] = None, dry_run: bool = False,
+                     fetch_images: bool = True, headed: bool = False) -> list[dict]:
     """
     Run the full EB Games product discovery flow.
-
-    1. Fetch each category page
-    2. Strip HTML down to product listings
-    3. Send to Claude to extract product URLs + names
-    4. Enrich and deduplicate
-    5. Save to DB (unless dry_run)
     """
     all_products = []
     seen_urls = set()
 
-    categories = EBGAMES_CATEGORY_URLS = EB_CATEGORY_URLS
+    categories = EB_CATEGORY_URLS
     if tcg_filter:
         categories = {k: v for k, v in categories.items() if k == tcg_filter}
         if not categories:
-            logger.error(f"Unknown TCG filter: {tcg_filter}. Valid: {list(EB_CATEGORY_URLS.keys())}")
+            logger.error(f"Unknown TCG: {tcg_filter}. Valid: {list(EB_CATEGORY_URLS.keys())}")
             return []
 
-    logger.info(f"🔍 Starting EB Games discovery ({len(categories)} TCG types)")
+    logger.info(f"🔍 Starting EB Games discovery")
+    logger.info(f"   TCG: {tcg_filter or 'all'}")
     logger.info(f"   Mode: {'DRY RUN' if dry_run else 'LIVE'}")
+    logger.info(f"   Browser: {'HEADED' if headed else 'headless'}")
+    logger.info(f"   Images: {'yes' if fetch_images else 'skip'}")
     logger.info("")
 
     for tcg, urls in categories.items():
         logger.info(f"── {tcg.upper()} ──────────────────────────────")
 
         for url in urls:
-            logger.info(f"  Fetching: {url}")
+            raw_products = scrape_category_page(url, tcg, headed=headed)
 
-            # Step 1: Fetch the page
-            html = fetch_category_page(url)
-            if not html:
-                continue
-
-            # Step 2: Strip down HTML
-            page_content = extract_product_listing_html(html)
-            logger.info(f"  Extracted {len(page_content):,} chars of content")
-
-            # Step 3: Claude extraction
-            logger.info(f"  Sending to Claude Haiku...")
-            raw_products = extract_products_with_claude(page_content, tcg, url)
-
-            # Step 4: Enrich and deduplicate
             for raw in raw_products:
                 enriched = enrich_product(raw, tcg)
                 if not enriched:
@@ -604,49 +691,49 @@ def discover_ebgames(tcg_filter: Optional[str] = None, dry_run: bool = False) ->
                 seen_urls.add(enriched["url"])
                 all_products.append(enriched)
 
-            # Be polite between requests
             time.sleep(2)
 
-    # Step 5: Fetch images for all discovered products
-    if all_products:
-        logger.info(f"🖼️  Fetching images for {len(all_products)} products...")
-        for product in all_products:
-            image_url = fetch_product_image(product["url"])
-            if image_url:
-                product["image"] = image_url
-                logger.info(f"  ✅ {product['name'][:50]}")
-            else:
-                logger.info(f"  ⚠️  No image: {product['name'][:50]}")
-            time.sleep(1)  # Be polite between product page fetches
-        logger.info("")
+    logger.info(f"\n📦 Total unique products after filtering: {len(all_products)}")
 
-        logger.info("")
+    # Fetch images
+    if fetch_images and all_products:
+        needs_image = [p for p in all_products if not p.get("image")]
+        if needs_image:
+            logger.info(f"🖼️  Fetching product images ({len(needs_image)} pages)...")
+            for i, product in enumerate(needs_image, 1):
+                logger.info(f"  [{i}/{len(needs_image)}] {product['name'][:55]}")
+                image_url = fetch_product_image_playwright(product["url"])
+                if image_url:
+                    product["image"] = image_url
+                    logger.info(f"    ✅ {image_url[:80]}")
+                else:
+                    logger.info(f"    ⚠️  No image found")
+                time.sleep(1)
+            logger.info("")
+        else:
+            logger.info("🖼️  All products already have images from category tiles")
 
-    logger.info(f"📦 Total unique products found: {len(all_products)}")
-    logger.info("")
-
-    # Step 5: Save or display
+    # Output
     if dry_run:
-        logger.info("── DRY RUN — Products that would be added ─────")
+        logger.info("── DRY RUN — Would add these products ────────")
         for p in all_products:
             set_label = f" [{p['set']}]" if p.get("set") else ""
-            image_label = " 🖼️" if p.get("image") else " (no image)"
-            logger.info(f"  {p['name']}{set_label}{image_label}")
+            price_label = f" {p['price_str']}" if p.get("price_str") else ""
+            img_label = " 🖼️" if p.get("image") else ""
+            preorder_label = " ⏳PREORDER" if p.get("is_preorder") else ""
+            logger.info(f"  {p['name']}{set_label}{price_label}{img_label}{preorder_label}")
             logger.info(f"    {p['url']}")
-            if p.get("image"):
-                logger.info(f"    {p['image']}")
         logger.info("")
-        logger.info("── Config entries (copy to config/products.py) ─")
-        print(update_products_config(all_products))
-
+        logger.info("── config/products.py entries ─────────────────")
+        print(generate_config_entries(all_products))
     else:
         if DB_AVAILABLE:
             db = Database()
             added, skipped = save_new_products(all_products, db)
-            logger.info(f"✅ Discovery complete: {added} added, {skipped} already tracked")
+            logger.info(f"✅ Done: {added} added, {skipped} already tracked")
         else:
-            logger.warning("Database not available — printing config entries instead")
-            print(update_products_config(all_products))
+            logger.warning("DB not available — printing config entries")
+            print(generate_config_entries(all_products))
 
     return all_products
 
@@ -659,29 +746,27 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    parser = argparse.ArgumentParser(
-        description="EB Games AU — AI-powered TCG product discovery"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print found products without saving to DB",
-    )
-    parser.add_argument(
-        "--tcg",
-        type=str,
-        default=None,
-        help=f"Only discover this TCG. Options: {', '.join(EB_CATEGORY_URLS.keys())}",
-    )
+    parser = argparse.ArgumentParser(description="EB Games AU — TCG product discovery")
+    parser.add_argument("--dry-run", action="store_true", help="Don't save to DB")
+    parser.add_argument("--tcg", type=str, default=None,
+                        help=f"TCG to discover. Options: {', '.join(EB_CATEGORY_URLS.keys())}")
+    parser.add_argument("--no-images", action="store_true", help="Skip image fetching (faster)")
+    parser.add_argument("--headed", action="store_true",
+                        help="Run browser in headed mode (visible). Use on first run to pass Cloudflare challenge.")
     args = parser.parse_args()
 
-    if not ANTHROPIC_API_KEY:
-        print("❌ ANTHROPIC_API_KEY not set!")
-        print("   Get an API key at: https://console.anthropic.com")
-        print("   Then: export ANTHROPIC_API_KEY=sk-ant-...")
+    if not PLAYWRIGHT_AVAILABLE:
+        print("❌ Playwright not installed.")
+        print("   pip install playwright")
+        print("   playwright install chromium")
         sys.exit(1)
 
-    discover_ebgames(tcg_filter=args.tcg, dry_run=args.dry_run)
+    discover_ebgames(
+        tcg_filter=args.tcg,
+        dry_run=args.dry_run,
+        fetch_images=not args.no_images,
+        headed=args.headed,
+    )
 
 
 if __name__ == "__main__":
