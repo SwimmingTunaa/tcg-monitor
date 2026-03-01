@@ -33,6 +33,19 @@ class Database:
         conn = self._get_conn()
         try:
             conn.executescript("""
+                CREATE TABLE IF NOT EXISTS canonical_products (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    set_key TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    tcg TEXT NOT NULL DEFAULT 'pokemon',
+                    msrp REAL,
+                    image TEXT,
+                    release_date TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS product_status (
                     url TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -43,7 +56,10 @@ class Database:
                     stock_text TEXT,
                     image_url TEXT,
                     last_checked TEXT NOT NULL,
-                    last_changed TEXT NOT NULL
+                    last_changed TEXT NOT NULL,
+                    canonical_id TEXT,
+                    match_status TEXT DEFAULT 'unmatched',
+                    FOREIGN KEY (canonical_id) REFERENCES canonical_products(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS price_history (
@@ -67,11 +83,33 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_alert_log_url
                     ON alert_log(url, sent_at);
+
+                CREATE INDEX IF NOT EXISTS idx_product_status_canonical
+                    ON product_status(canonical_id);
+
+                CREATE INDEX IF NOT EXISTS idx_product_status_match
+                    ON product_status(match_status);
             """)
+
+            # Migrate existing DB — add new columns if they don't exist yet
+            self._migrate(conn)
+
             conn.commit()
             logger.info(f"Database initialized at {self.db_path}")
         finally:
             conn.close()
+
+    def _migrate(self, conn: sqlite3.Connection):
+        """Add new columns to existing tables if upgrading from an older schema."""
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(product_status)")
+        }
+        if "canonical_id" not in existing_cols:
+            conn.execute("ALTER TABLE product_status ADD COLUMN canonical_id TEXT")
+            logger.info("Migrated: added canonical_id to product_status")
+        if "match_status" not in existing_cols:
+            conn.execute("ALTER TABLE product_status ADD COLUMN match_status TEXT DEFAULT 'unmatched'")
+            logger.info("Migrated: added match_status to product_status")
 
     # ─── Product Status ──────────────────────────────────────────────
 
@@ -190,6 +228,97 @@ class Database:
                 (url, alert_type, datetime.now().isoformat())
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    # ─── Canonical Products ─────────────────────────────────────────
+
+    def upsert_canonical(self, id: str, name: str, set_key: str, type: str,
+                         tcg: str = "pokemon", msrp: Optional[float] = None,
+                         image: Optional[str] = None,
+                         release_date: Optional[str] = None) -> bool:
+        """Insert or update a canonical product. Returns True if new."""
+        conn = self._get_conn()
+        try:
+            existing = conn.execute(
+                "SELECT id FROM canonical_products WHERE id = ?", (id,)
+            ).fetchone()
+
+            conn.execute("""
+                INSERT INTO canonical_products
+                    (id, name, set_key, type, tcg, msrp, image, release_date, active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    set_key = excluded.set_key,
+                    type = excluded.type,
+                    msrp = excluded.msrp,
+                    image = excluded.image,
+                    release_date = excluded.release_date,
+                    active = 1
+            """, (id, name, set_key, type, tcg, msrp, image,
+                  release_date, datetime.now().isoformat()))
+            conn.commit()
+            return existing is None  # True if newly inserted
+        finally:
+            conn.close()
+
+    def get_canonical(self, id: str) -> Optional[dict]:
+        """Get a canonical product by ID."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM canonical_products WHERE id = ?", (id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_all_canonical(self, tcg: str = None, active_only: bool = True) -> list[dict]:
+        """Get all canonical products, optionally filtered by TCG."""
+        conn = self._get_conn()
+        try:
+            query = "SELECT * FROM canonical_products WHERE 1=1"
+            params = []
+            if active_only:
+                query += " AND active = 1"
+            if tcg:
+                query += " AND tcg = ?"
+                params.append(tcg)
+            query += " ORDER BY set_key, type"
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def set_canonical_match(self, url: str, canonical_id: Optional[str],
+                            match_status: str):
+        """Update the canonical match for a product_status row."""
+        conn = self._get_conn()
+        try:
+            conn.execute("""
+                UPDATE product_status
+                SET canonical_id = ?, match_status = ?
+                WHERE url = ?
+            """, (canonical_id, match_status, url))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_unmatched(self, retailer: str = None) -> list[dict]:
+        """Get all product_status rows flagged as unmatched or review."""
+        conn = self._get_conn()
+        try:
+            query = """
+                SELECT * FROM product_status
+                WHERE match_status IN ('unmatched', 'review')
+            """
+            params = []
+            if retailer:
+                query += " AND retailer = ?"
+                params.append(retailer)
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
         finally:
             conn.close()
 

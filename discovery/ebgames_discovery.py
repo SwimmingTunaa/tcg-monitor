@@ -48,9 +48,11 @@ except ImportError:
 try:
     from utils.database import Database
     from utils.helpers import get_random_headers, RETAILER_NAMES
+    from canonical.matcher import match_product
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
+    match_product = None
     print("⚠️  Could not import project utils — running in standalone mode")
 
 logger = logging.getLogger(__name__)
@@ -506,8 +508,22 @@ def save_new_products(products: list[dict], db: "Database") -> tuple[int, int]:
             image_url=product.get("image") or None,
             status_changed=False,
         )
+
+        # Attempt canonical matching
+        if match_product:
+            set_key = product.get("set") if product.get("tcg") == "pokemon" else None
+            match = match_product(
+                product["name"], db,
+                tcg=product.get("tcg", "pokemon"),
+                set_key=set_key,
+            )
+            db.set_canonical_match(url, match["canonical_id"], match["status"])
+            match_label = f" → {match['canonical_id']} ({match['score']:.0%})" if match["canonical_id"] else f" (unmatched, {match['score']:.0%})"
+            logger.info(f"  ✅ Added: {product['name']}{match_label}")
+        else:
+            logger.info(f"  ✅ Added: {product['name']}")
+
         added += 1
-        logger.info(f"  ✅ Added: {product['name']}")
 
     return added, skipped
 

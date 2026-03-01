@@ -15,10 +15,10 @@ the #journey-together set channel AND the #amazon-au retailer channel.
 # These fire for ANY product restock at that retailer
 RETAILER_WEBHOOKS = {
     "amazon_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
-    "ebgames_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
+    "ebgames_au": "https://discord.com/api/webhooks/1477634852202348787/lLWL8FW88wqtse7w4-gUkZfS5KMpI2x7I08hn9ablFGH5D25wVkduzG1SxpcOJR2jybH",
     "jbhifi_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
     "bigw_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
-    "kmart_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
+    "kmart_au": "https://discord.com/api/webhooks/1477637245702901832/SvoC1yxoIu-DSqzB2LERQg48ozu6niFYNZcfBSvVkpYwNk_xRRx2bsYHABmGDtuMYA52",
     "target_au": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
 }
 
