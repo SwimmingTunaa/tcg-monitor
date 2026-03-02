@@ -406,14 +406,25 @@ def scrape_category_playwright(url: str, headed: bool = False) -> list[dict]:
                 except PlaywrightTimeout:
                     logger.info(f"  [headed] Still waiting — trying DOM parse...")
             else:
-                # Headless: wait for tiles to appear
+                # Headless: wait for tiles to hydrate (JS adds data-sku)
                 try:
-                    page.wait_for_selector('.product-tile[data-sku]', timeout=15000)
+                    page.wait_for_selector('.product-tile[data-sku]', timeout=30000)
                 except PlaywrightTimeout:
-                    pass  # Will try DOM parse below
+                    # Log what we see so we can diagnose
+                    counts = page.evaluate("""
+                        () => {
+                            const all = document.querySelectorAll('.product-tile');
+                            const hydrated = document.querySelectorAll('.product-tile[data-sku]');
+                            return { total: all.length, hydrated: hydrated.length };
+                        }
+                    """)
+                    logger.warning(
+                        f"  Timed out waiting for hydrated tiles. "
+                        f"Total tiles: {counts['total']}, hydrated: {counts['hydrated']}"
+                    )
 
             # Extra wait for hydration
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
 
             # Scroll to trigger lazy-loaded carousels
             logger.info(f"  Scrolling to load all products...")
@@ -611,6 +622,7 @@ def save_new_products(products: list[dict], db: "Database") -> tuple[int, int]:
             price=product.get("price"),
             price_str=product.get("price_str"),
             image_url=product.get("image") or None,
+            sku=product.get("sku") or None,
             status_changed=False,
         )
 

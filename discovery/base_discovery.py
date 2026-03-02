@@ -281,6 +281,7 @@ def save_new_products(products: list[dict], db) -> tuple[int, int]:
             price=product.get("price"),
             price_str=product.get("price_str"),
             image_url=product.get("image") or None,
+            sku=product.get("sku") or None,
             status_changed=False,
         )
 

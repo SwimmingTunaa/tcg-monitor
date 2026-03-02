@@ -3,13 +3,13 @@ JB Hi-Fi AU — Product Discovery
 =================================
 Discovers TCG product URLs from JB Hi-Fi AU.
 
-Strategy (three-pass):
-  1. Algolia search API — JB Hi-Fi uses Algolia for product search.
-     App ID and search-only API key are auto-fetched from the page
-     source or loaded from .env (JBHIFI_ALGOLIA_APP_ID / JBHIFI_ALGOLIA_API_KEY).
-     Returns structured JSON — no scraping needed.
-  2. Raw HTTP + BeautifulSoup — parses server-rendered product tiles.
-  3. Playwright with persistent context — full JS rendering as last resort.
+Strategy (four-pass):
+  1. Algolia browse API — JB Hi-Fi uses Algolia with category filters to
+     power their collection pages. Uses the same credentials and filters
+     as the frontend (index: shopify_products_families, browse endpoint).
+  2. Shopify Storefront GraphQL API — fallback search via Shopify Hydrogen.
+  3. Raw HTTP + BeautifulSoup — parses server-rendered product tiles.
+  4. Playwright with persistent context — full JS rendering as last resort.
 
 Usage:
     python discovery/jbhifi_discovery.py --tcg pokemon --dry-run
@@ -65,9 +65,16 @@ logger = logging.getLogger(__name__)
 
 # ─── Configuration ───────────────────────────────────────────────────
 
-# Algolia credentials — loaded from .env, auto-fetched if blank
-JBHIFI_ALGOLIA_APP_ID = os.getenv("JBHIFI_ALGOLIA_APP_ID", "")
-JBHIFI_ALGOLIA_API_KEY = os.getenv("JBHIFI_ALGOLIA_API_KEY", "")
+# Shopify Storefront GraphQL API config
+SHOPIFY_STOREFRONT_TOKEN = os.getenv("JBHIFI_STOREFRONT_TOKEN", "")
+
+SHOPIFY_SEARCH_QUERIES = {
+    "pokemon": "pokemon trading card",
+    "one-piece": "one piece trading card",
+    "mtg": "magic the gathering",
+    "dragon-ball-z": "dragon ball super card",
+    "lorcana": "lorcana trading card",
+}
 
 SESSION = make_session()
 
@@ -91,132 +98,165 @@ JBHIFI_CATEGORY_URLS = {
     ],
 }
 
-# Algolia search queries per TCG
-ALGOLIA_TCG_QUERIES = {
-    "pokemon": "pokemon trading card",
-    "one-piece": "one piece trading card",
-    "mtg": "magic the gathering",
-    "dragon-ball-z": "dragon ball super card",
-    "lorcana": "lorcana trading card",
+# ─── Strategy 1: Algolia Browse API ───────────────────────────────
+
+ALGOLIA_APP_ID = os.getenv("JBHIFI_ALGOLIA_APP_ID", "VTVKM5URPX")
+ALGOLIA_API_KEY = os.getenv("JBHIFI_ALGOLIA_API_KEY", "1d989f0839a992bbece9099e1b091f07")
+ALGOLIA_INDEX = "shopify_products_families"
+
+# Filter strings per TCG — extracted from JB Hi-Fi's frontend JS.
+# These match exactly what the browser sends to Algolia on each collection page.
+ALGOLIA_TCG_FILTERS = {
+    "pokemon": (
+        '("facets.Game type": "Trading card games" OR "category_hierarchy":"Trading card games")'
+        ' AND "facets.Brands": "Pokemon TCG"'
+    ),
+    "one-piece": (
+        '("facets.Game type": "Trading card games" OR "category_hierarchy":"Trading card games")'
+        ' AND "facets.Brands": "One Piece Card Game"'
+    ),
+    "mtg": (
+        '("facets.Game type": "Trading card games" OR "category_hierarchy":"Trading card games")'
+        ' AND "facets.Brands": "Magic The Gathering"'
+    ),
+    "dragon-ball-z": (
+        '("facets.Game type": "Trading card games" OR "category_hierarchy":"Trading card games")'
+        ' AND "facets.Brands": "Dragon Ball Super Card Game"'
+    ),
+    "lorcana": (
+        '("facets.Game type": "Trading card games" OR "category_hierarchy":"Trading card games")'
+        ' AND "facets.Brands": "Disney Lorcana"'
+    ),
 }
 
 
-# ─── Strategy 1: Algolia API ─────────────────────────────────────────
-
-def fetch_algolia_credentials() -> tuple[str, str]:
+def scrape_algolia_browse(tcg: str) -> list[dict]:
     """
-    Auto-fetch Algolia App ID and search API key from JB Hi-Fi's page source.
+    Browse JB Hi-Fi products via the Algolia browse endpoint with filters.
 
-    JB Hi-Fi embeds Algolia config in their JS bundle. The credentials are
-    search-only (public read) so it's safe to extract and use them.
-
-    Returns (app_id, api_key) or ("", "") if not found.
-    """
-    try:
-        resp = SESSION.get(
-            "https://www.jbhifi.com.au/",
-            headers=REQUEST_HEADERS,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        html = resp.text
-
-        # Pattern 1: Algolia config object in inline JS
-        # e.g. {"appId":"XXXXXXXX","apiKey":"xxxxxxxxxxxxxxxxxxxxxxxx","indexName":"prod_..."}
-        app_id_match = re.search(r'"appId"\s*:\s*"([A-Z0-9]{8,12})"', html)
-        api_key_match = re.search(r'"apiKey"\s*:\s*"([a-f0-9]{32})"', html)
-
-        if app_id_match and api_key_match:
-            return app_id_match.group(1), api_key_match.group(1)
-
-        # Pattern 2: Algolia credentials in script src attributes or window config
-        soup = BeautifulSoup(html, "lxml")
-        for script in soup.find_all("script"):
-            text = script.string or ""
-            app_id_m = re.search(r'(?:ALGOLIA_APP_ID|algoliaAppId|appId)["\s:=]+([A-Z0-9]{8,12})', text)
-            api_key_m = re.search(r'(?:ALGOLIA_API_KEY|algoliaApiKey|apiKey)["\s:=]+([a-f0-9]{32})', text)
-            if app_id_m and api_key_m:
-                return app_id_m.group(1), api_key_m.group(1)
-
-    except Exception as e:
-        logger.debug(f"  Algolia credential fetch failed: {e}")
-
-    return "", ""
-
-
-def scrape_algolia(tcg: str, app_id: str, api_key: str) -> list[dict]:
-    """
-    Search JB Hi-Fi products via the Algolia API.
+    This replicates the exact API call the JB Hi-Fi frontend makes on
+    collection pages. Uses filter-based browsing (not free-text search)
+    against the shopify_products_families index.
 
     Returns a flat list of raw product dicts ready for enrich_product().
     """
-    query = ALGOLIA_TCG_QUERIES.get(tcg, f"{tcg} trading card")
-    url = f"https://{app_id}-dsn.algolia.net/1/indexes/*/queries"
+    filters = ALGOLIA_TCG_FILTERS.get(tcg)
+    if not filters:
+        logger.info(f"  No Algolia filter configured for TCG: {tcg}")
+        return []
 
-    headers = {
-        "X-Algolia-Application-Id": app_id,
-        "X-Algolia-API-Key": api_key,
-        "Content-Type": "application/json",
-    }
-
-    # Try common JB Hi-Fi Algolia index names
-    index_names = ["prod_products", "products", "jbhifi_products", "au_products"]
-    params_str = f"query={requests.utils.quote(query)}&hitsPerPage=60&page=0"
-
-    body = {
-        "requests": [
-            {"indexName": idx, "params": params_str}
-            for idx in index_names
-        ]
-    }
+    url = (
+        f"https://{ALGOLIA_APP_ID}-dsn.algolia.net"
+        f"/1/indexes/{ALGOLIA_INDEX}/browse"
+        f"?x-algolia-api-key={ALGOLIA_API_KEY}"
+        f"&x-algolia-application-id={ALGOLIA_APP_ID}"
+    )
 
     products = []
-    try:
-        resp = SESSION.post(url, headers=headers, json=body, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+    cursor = None
+    page = 0
+    max_pages = 20
 
-        for result_set in data.get("results", []):
-            hits = result_set.get("hits", [])
+    while page < max_pages:
+        body: dict = {
+            "filters": filters,
+            "hitsPerPage": 100,
+        }
+        if cursor:
+            body["cursor"] = cursor
+
+        try:
+            resp = SESSION.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            logger.info(f"  Algolia browse response: {resp.status_code} (page {page + 1})")
+
+            if resp.status_code in (401, 403):
+                logger.warning(f"  Algolia {resp.status_code} — credentials may be invalid")
+                break
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            hits = data.get("hits", [])
+            if not hits:
+                if page == 0:
+                    logger.info("  Algolia browse returned 0 hits")
+                break
+
             for hit in hits:
-                name = hit.get("name") or hit.get("title") or hit.get("productName", "")
-                url_path = hit.get("url") or hit.get("handle") or hit.get("productUrl", "")
-                price_raw = hit.get("price") or hit.get("variants", [{}])[0].get("price", 0) if hit.get("variants") else 0
-                image = hit.get("image") or hit.get("imageUrl") or hit.get("featured_image", "")
-                sku = str(hit.get("id") or hit.get("sku") or hit.get("objectID", ""))
+                product = _parse_algolia_hit(hit)
+                if product:
+                    products.append(product)
 
-                if not name or not url_path:
-                    continue
+            # Algolia browse uses cursor-based pagination
+            cursor = data.get("cursor")
+            if not cursor:
+                break
 
-                # Build full URL
-                if url_path.startswith("/"):
-                    full_url = "https://www.jbhifi.com.au" + url_path
-                elif url_path.startswith("http"):
-                    full_url = url_path
-                else:
-                    full_url = f"https://www.jbhifi.com.au/products/{url_path}"
+            page += 1
+            time.sleep(0.5)
 
-                full_url = full_url.split("?")[0]
+        except Exception as e:
+            logger.warning(f"  Algolia browse failed: {e}")
+            break
 
-                price_num = float(price_raw) if price_raw else None
-                products.append({
-                    "name": name,
-                    "url": full_url,
-                    "price": f"${price_num:.2f}" if price_num else "",
-                    "price_raw": price_num,
-                    "sku": sku,
-                    "image": image if isinstance(image, str) else "",
-                    "is_preorder": "pre-order" in name.lower() or "preorder" in name.lower(),
-                    "promo": "",
-                })
-
-        if products:
-            logger.info(f"  ✅ Found {len(products)} via Algolia")
-
-    except Exception as e:
-        logger.warning(f"  Algolia search failed: {e}")
+    if products:
+        logger.info(f"  ✅ Found {len(products)} via Algolia browse")
+        for i, p in enumerate(products):
+            logger.info(f"    [{i+1}] {p['name']} | ${p.get('price_raw') or '?'} | {p['url']}")
 
     return products
+
+
+def _parse_algolia_hit(hit: dict) -> dict | None:
+    """Parse a single Algolia hit into our standard product dict."""
+    title = hit.get("title") or hit.get("name", "")
+    handle = hit.get("handle", "")
+
+    if not title or not handle:
+        return None
+
+    full_url = f"https://www.jbhifi.com.au/products/{handle}"
+
+    # Price
+    price_raw = None
+    if "price" in hit:
+        price_raw = hit["price"]
+    elif "variants" in hit and hit["variants"]:
+        first_variant = hit["variants"][0] if isinstance(hit["variants"], list) else {}
+        price_raw = first_variant.get("price")
+    elif "price_range" in hit:
+        price_raw = hit["price_range"].get("min") or hit["price_range"].get("minimum_price")
+
+    if isinstance(price_raw, str):
+        try:
+            price_raw = float(price_raw)
+        except ValueError:
+            price_raw = None
+
+    image = hit.get("image") or hit.get("featured_image", "")
+    if isinstance(image, dict):
+        image = image.get("src") or image.get("url") or ""
+
+    sku = str(hit.get("sku") or hit.get("objectID") or hit.get("id", ""))
+
+    name_lower = title.lower()
+    is_preorder = "pre-order" in name_lower or "preorder" in name_lower
+
+    return {
+        "name": title,
+        "url": full_url,
+        "price": f"${price_raw:.2f}" if price_raw else "",
+        "price_raw": price_raw,
+        "sku": sku,
+        "image": image if isinstance(image, str) else "",
+        "is_preorder": is_preorder,
+        "promo": "",
+    }
 
 
 # ─── Strategy 2: Raw HTTP ─────────────────────────────────────────────
@@ -312,6 +352,329 @@ def parse_products_from_html(html: str) -> list[dict]:
             })
 
     return products
+
+# ─── Strategy 2: Shopify Storefront GraphQL API ──────────────────────
+
+SHOPIFY_GRAPHQL_URL = "https://prod-jbhifi.myshopify.com/api/2025-01/graphql.json"
+
+GRAPHQL_SEARCH_QUERY = """
+query searchProducts($query: String!, $first: Int!, $after: String) {
+  search(query: $query, types: PRODUCT, first: $first, after: $after) {
+    edges {
+      node {
+        ... on Product {
+          id
+          title
+          handle
+          tags
+          featuredImage {
+            url
+          }
+          variants(first: 1) {
+            edges {
+              node {
+                sku
+                price {
+                  amount
+                  currencyCode
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"""
+
+GRAPHQL_COLLECTION_QUERY = """
+query collectionProducts($handle: String!, $first: Int!, $after: String) {
+  collection(handle: $handle) {
+    title
+    products(first: $first, after: $after) {
+      edges {
+        node {
+          id
+          title
+          handle
+          tags
+          featuredImage {
+            url
+          }
+          variants(first: 1) {
+            edges {
+              node {
+                sku
+                price {
+                  amount
+                  currencyCode
+                }
+              }
+            }
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
+"""
+
+# Collection handles per TCG — try multiple variations since Hydrogen
+# may use different handle formats than the URL path suggests
+SHOPIFY_COLLECTION_HANDLES = {
+    "pokemon": [
+        "pokemon-trading-cards",
+        "collectibles-merchandise-pokemon-trading-cards",
+        "pokemon-tcg",
+        "trading-card-games",
+    ],
+    "one-piece": ["trading-card-games"],
+    "mtg": ["trading-card-games"],
+    "dragon-ball-z": ["trading-card-games"],
+    "lorcana": ["trading-card-games"],
+}
+
+
+def scrape_shopify_graphql(tcg: str) -> list[dict]:
+    """
+    Fetch products via Shopify's Storefront GraphQL API.
+
+    JB Hi-Fi uses Shopify Hydrogen (headless), so the traditional REST
+    JSON endpoints are disabled. The Storefront GraphQL API is the
+    actual data source their frontend uses.
+
+    Strategy:
+      a) Collection query — fetch all products from known collection handles.
+      b) Search query — fallback for TCGs without a collection handle.
+
+    Requires JBHIFI_STOREFRONT_TOKEN in .env (public read-only token).
+
+    Returns a flat list of raw product dicts ready for enrich_product().
+    """
+    token = SHOPIFY_STOREFRONT_TOKEN
+    if not token:
+        logger.info("  JBHIFI_STOREFRONT_TOKEN not set in .env — skipping GraphQL")
+        return []
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "X-Shopify-Storefront-Access-Token": token,
+    }
+
+    products = []
+    seen_urls: set[str] = set()
+
+    # (a) Try collection handles first (stop at the first one that works)
+    handles = SHOPIFY_COLLECTION_HANDLES.get(tcg, [])
+    for handle in handles:
+        collection_products = _graphql_collection(handle, headers, seen_urls)
+        if collection_products:
+            products.extend(collection_products)
+            break
+
+    # (b) Fallback: search query
+    if not products:
+        query_str = SHOPIFY_SEARCH_QUERIES.get(tcg, f"{tcg} trading card")
+        search_products = _graphql_search(query_str, headers, seen_urls)
+        products.extend(search_products)
+
+    if products:
+        logger.info(f"  ✅ Found {len(products)} via Storefront GraphQL")
+        for i, p in enumerate(products):
+            logger.info(f"    [{i+1}] {p['name']} | ${p.get('price_raw') or '?'} | {p['url']}")
+
+    return products
+
+
+def _graphql_collection(handle: str, headers: dict, seen_urls: set[str]) -> list[dict]:
+    """Fetch all products from a Shopify collection via GraphQL."""
+    products = []
+    after_cursor = None
+    page = 0
+    max_pages = 10
+
+    logger.info(f"  Querying collection: {handle}")
+
+    while page < max_pages:
+        variables = {"handle": handle, "first": 50}
+        if after_cursor:
+            variables["after"] = after_cursor
+
+        try:
+            resp = SESSION.post(
+                SHOPIFY_GRAPHQL_URL,
+                headers=headers,
+                json={"query": GRAPHQL_COLLECTION_QUERY, "variables": variables},
+                timeout=20,
+            )
+            logger.info(f"  Collection GraphQL response: {resp.status_code} (page {page + 1})")
+
+            if resp.status_code in (401, 403):
+                logger.info(f"  Collection GraphQL {resp.status_code} — token issue")
+                break
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "errors" in data:
+                logger.info(f"  Collection GraphQL errors: {str(data['errors'])[:200]}")
+                break
+
+            collection = data.get("data", {}).get("collection")
+            if not collection:
+                logger.info(f"  Collection '{handle}' not found")
+                break
+
+            edges = collection.get("products", {}).get("edges", [])
+            if not edges:
+                if page == 0:
+                    logger.info(f"  Collection '{handle}' has 0 products")
+                break
+
+            for edge in edges:
+                node = edge.get("node", {})
+                product = _parse_graphql_product(node)
+                if product and product["url"] not in seen_urls:
+                    seen_urls.add(product["url"])
+                    products.append(product)
+
+            page_info = collection.get("products", {}).get("pageInfo", {})
+            if page_info.get("hasNextPage") and page_info.get("endCursor"):
+                after_cursor = page_info["endCursor"]
+                page += 1
+                time.sleep(1)
+            else:
+                break
+
+        except Exception as e:
+            logger.info(f"  Collection GraphQL failed: {e}")
+            break
+
+    return products
+
+
+def _graphql_search(query_str: str, headers: dict, seen_urls: set[str]) -> list[dict]:
+    """Search products via Shopify Storefront GraphQL search query."""
+    products = []
+    after_cursor = None
+    page = 0
+    max_pages = 10
+
+    logger.info(f"  Searching GraphQL: '{query_str}'")
+
+    while page < max_pages:
+        variables = {"query": query_str, "first": 50}
+        if after_cursor:
+            variables["after"] = after_cursor
+
+        try:
+            resp = SESSION.post(
+                SHOPIFY_GRAPHQL_URL,
+                headers=headers,
+                json={"query": GRAPHQL_SEARCH_QUERY, "variables": variables},
+                timeout=20,
+            )
+
+            if resp.status_code in (401, 403):
+                logger.info(f"  Search GraphQL {resp.status_code} — token issue")
+                break
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "errors" in data:
+                logger.info(f"  Search GraphQL errors: {str(data['errors'])[:200]}")
+                break
+
+            search_data = data.get("data", {}).get("search", {})
+            edges = search_data.get("edges", [])
+
+            if not edges:
+                if page == 0:
+                    logger.info(f"  Search returned 0 products")
+                break
+
+            for edge in edges:
+                node = edge.get("node", {})
+                product = _parse_graphql_product(node)
+                if product and product["url"] not in seen_urls:
+                    seen_urls.add(product["url"])
+                    products.append(product)
+
+            page_info = search_data.get("pageInfo", {})
+            if page_info.get("hasNextPage") and page_info.get("endCursor"):
+                after_cursor = page_info["endCursor"]
+                page += 1
+                time.sleep(1)
+            else:
+                break
+
+        except Exception as e:
+            logger.info(f"  Search GraphQL failed: {e}")
+            break
+
+    return products
+
+
+def _parse_graphql_product(node: dict) -> dict | None:
+    """Parse a product node from the Storefront GraphQL search response."""
+    title = node.get("title", "").strip()
+    handle = node.get("handle", "")
+    if not title or not handle:
+        return None
+
+    url = f"https://www.jbhifi.com.au/products/{handle}"
+
+    # Price from first variant
+    price_raw = None
+    price_str = ""
+    sku = ""
+    variant_edges = node.get("variants", {}).get("edges", [])
+    if variant_edges:
+        variant = variant_edges[0].get("node", {})
+        sku = variant.get("sku", "")
+        price_obj = variant.get("price", {})
+        if price_obj:
+            try:
+                price_raw = float(price_obj.get("amount", 0))
+                price_str = f"${price_raw:.2f}"
+            except (ValueError, TypeError):
+                pass
+
+    # Image
+    image = ""
+    featured = node.get("featuredImage") or {}
+    image = featured.get("url", "")
+
+    # Pre-order detection
+    tags = node.get("tags", [])
+    is_preorder = (
+        "pre-order" in title.lower()
+        or "preorder" in title.lower()
+        or any("pre-order" in t.lower() for t in tags if isinstance(t, str))
+    )
+
+    return {
+        "name": title,
+        "url": url,
+        "price": price_str,
+        "price_raw": price_raw,
+        "sku": sku,
+        "image": image,
+        "is_preorder": is_preorder,
+        "promo": "",
+    }
 
 
 def scrape_category_raw(url: str) -> list[dict]:
@@ -475,27 +838,22 @@ def discover_jbhifi(tcg_filter: Optional[str] = None, dry_run: bool = False,
     logger.info(f"   Mode: {'DRY RUN' if dry_run else 'LIVE'}")
     logger.info("")
 
-    # Resolve Algolia credentials once
-    app_id = JBHIFI_ALGOLIA_APP_ID
-    api_key = JBHIFI_ALGOLIA_API_KEY
-    if not app_id or not api_key:
-        logger.info("  Algolia credentials not in .env — auto-fetching from page source...")
-        app_id, api_key = fetch_algolia_credentials()
-        if app_id and api_key:
-            logger.info(f"  ✅ Algolia: app_id={app_id}")
-        else:
-            logger.info("  Algolia credentials not found — will use HTML scraping")
-
     for tcg, urls in categories.items():
         logger.info(f"── {tcg.upper()} ──────────────────────────────")
 
         raw_products: list[dict] = []
 
-        # Strategy 1: Algolia
-        if app_id and api_key:
-            raw_products = scrape_algolia(tcg, app_id, api_key)
+        # Strategy 1: Algolia browse with filters
+        raw_products = scrape_algolia_browse(tcg)
 
-        # Strategy 2 & 3: Scraping fallback
+        # Strategy 2: Shopify Storefront GraphQL API
+        if not raw_products:
+            logger.info("  Trying Shopify Storefront GraphQL API...")
+            raw_products = scrape_shopify_graphql(tcg)
+            if not raw_products:
+                logger.info("  Storefront GraphQL returned no products")
+
+        # Strategy 3 & 4: HTML scraping fallback
         if not raw_products:
             for url in urls:
                 raw_products += scrape_category_page(url, headed=headed)

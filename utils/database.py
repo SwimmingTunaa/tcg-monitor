@@ -110,6 +110,9 @@ class Database:
         if "match_status" not in existing_cols:
             conn.execute("ALTER TABLE product_status ADD COLUMN match_status TEXT DEFAULT 'unmatched'")
             logger.info("Migrated: added match_status to product_status")
+        if "sku" not in existing_cols:
+            conn.execute("ALTER TABLE product_status ADD COLUMN sku TEXT")
+            logger.info("Migrated: added sku to product_status")
 
     # ─── Product Status ──────────────────────────────────────────────
 
@@ -129,6 +132,7 @@ class Database:
                       price_str: Optional[str] = None,
                       stock_text: Optional[str] = None,
                       image_url: Optional[str] = None,
+                      sku: Optional[str] = None,
                       status_changed: bool = False):
         """Upsert the current product status."""
         now = datetime.now().isoformat()
@@ -145,8 +149,8 @@ class Database:
             conn.execute("""
                 INSERT INTO product_status
                     (url, name, retailer, in_stock, price, price_str,
-                     stock_text, image_url, last_checked, last_changed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     stock_text, image_url, sku, last_checked, last_changed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
                     name = excluded.name,
                     retailer = excluded.retailer,
@@ -155,10 +159,11 @@ class Database:
                     price_str = excluded.price_str,
                     stock_text = excluded.stock_text,
                     image_url = excluded.image_url,
+                    sku = COALESCE(excluded.sku, product_status.sku),
                     last_checked = excluded.last_checked,
                     last_changed = ?
             """, (url, name, retailer, int(in_stock), price, price_str,
-                  stock_text, image_url, now, now, last_changed))
+                  stock_text, image_url, sku, now, now, last_changed))
             conn.commit()
         finally:
             conn.close()
