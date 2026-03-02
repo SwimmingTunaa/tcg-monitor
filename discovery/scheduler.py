@@ -17,54 +17,61 @@ import sys
 import time
 import logging
 import argparse
-import threading
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Import discovery modules (add more retailers here as you build them)
+# Import all retailer discovery functions
 from discovery.ebgames_discovery import discover_ebgames
+from discovery.jbhifi_discovery import discover_jbhifi
+from discovery.bigw_discovery import discover_bigw
+from discovery.kmart_discovery import discover_kmart
+from discovery.target_discovery import discover_target
+from discovery.amazon_discovery import discover_amazon
 
 logger = logging.getLogger(__name__)
 
-# How often to run discovery (in seconds)
-# Default: once per week
-DISCOVERY_INTERVAL = 7 * 24 * 60 * 60  # 1 week
+# How often to run discovery (in seconds) — default: once per week
+DISCOVERY_INTERVAL = 7 * 24 * 60 * 60
 
 # Run at this hour (24h) to avoid peak times
 PREFERRED_HOUR = 3  # 3am
 
 
-def run_all_discovery(dry_run: bool = False):
-    """Run all discovery jobs."""
-    logger.info("=" * 50)
+def run_all_discovery(dry_run: bool = False) -> dict:
+    """Run all discovery jobs in sequence. Returns {retailer: product_count}."""
+    logger.info("=" * 60)
     logger.info(f"🔍 Running discovery jobs — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
+
+    jobs = [
+        ("1/6", "EB Games AU",  discover_ebgames, "ebgames_au"),
+        ("2/6", "JB Hi-Fi AU",  discover_jbhifi,  "jbhifi_au"),
+        ("3/6", "Big W AU",     discover_bigw,    "bigw_au"),
+        ("4/6", "Kmart AU",     discover_kmart,   "kmart_au"),
+        ("5/6", "Target AU",    discover_target,  "target_au"),
+        ("6/6", "Amazon AU",    discover_amazon,  "amazon_au"),
+    ]
 
     results = {}
 
-    # ── EB Games ───────────────────────────────────────────
-    try:
-        logger.info("\n[1/1] EB Games AU Discovery")
-        products = discover_ebgames(dry_run=dry_run)
-        results["ebgames_au"] = len(products)
-    except Exception as e:
-        logger.error(f"EB Games discovery failed: {e}", exc_info=True)
-        results["ebgames_au"] = 0
+    for step, name, fn, key in jobs:
+        logger.info(f"\n[{step}] {name} Discovery")
+        try:
+            products = fn(dry_run=dry_run)
+            results[key] = len(products)
+        except Exception as e:
+            logger.error(f"{name} discovery failed: {e}", exc_info=True)
+            results[key] = 0
 
-    # ── Add more retailers here as you build them ──────────
-    # try:
-    #     logger.info("\n[2/N] JB Hi-Fi AU Discovery")
-    #     products = discover_jbhifi(dry_run=dry_run)
-    #     results["jbhifi_au"] = len(products)
-    # except Exception as e:
-    #     logger.error(f"JB Hi-Fi discovery failed: {e}")
-
-    logger.info("\n" + "=" * 50)
+    logger.info("\n" + "=" * 60)
     logger.info("📊 Discovery Summary:")
+    total = 0
     for retailer, count in results.items():
-        logger.info(f"   {retailer}: {count} products found")
-    logger.info("=" * 50)
+        logger.info(f"   {retailer:<20} {count} products found")
+        total += count
+    logger.info(f"   {'TOTAL':<20} {total}")
+    logger.info("=" * 60)
 
     return results
 
@@ -117,7 +124,7 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print found products without saving",
+        help="Print found products without saving to DB",
     )
     args = parser.parse_args()
 

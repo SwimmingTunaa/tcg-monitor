@@ -1,0 +1,71 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "TCG Monitor (all retailers)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["main.py"],
+      "port": 0
+    },
+    {
+      "name": "TCG Monitor (test mode, single cycle)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["main.py", "--test"],
+      "port": 0
+    },
+    {
+      "name": "Discord Admin Bot",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["bot.py"],
+      "port": 0
+    },
+    {
+      "name": "Discovery Scheduler (weekly)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/scheduler.py"],
+      "port": 0
+    },
+    {
+      "name": "Discovery Scheduler (run once now)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/scheduler.py", "--once"],
+      "port": 0
+    },
+    {
+      "name": "Discovery — EB Games (dry run)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/ebgames_discovery.py", "--tcg", "pokemon", "--dry-run"],
+      "port": 0
+    },
+    {
+      "name": "Discovery — JB Hi-Fi (dry run)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/jbhifi_discovery.py", "--tcg", "pokemon", "--dry-run"],
+      "port": 0
+    },
+    {
+      "name": "Discovery — Big W (dry run)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/bigw_discovery.py", "--tcg", "pokemon", "--dry-run"],
+      "port": 0
+    },
+    {
+      "name": "Discovery — Kmart (dry run)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/kmart_discovery.py", "--tcg", "pokemon", "--dry-run"],
+      "port": 0
+    },
+    {
+      "name": "Discovery — Target (dry run)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/target_discovery.py", "--tcg", "pokemon", "--dry-run"],
+      "port": 0
+    },
+    {
+      "name": "Discovery — Amazon AU (dry run, headed)",
+      "runtimeExecutable": "venv/bin/python3",
+      "runtimeArgs": ["discovery/amazon_discovery.py", "--tcg", "pokemon", "--dry-run", "--headed"],
+      "port": 0
+    }
+  ]
+}

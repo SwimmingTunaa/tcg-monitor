@@ -1,18 +1,17 @@
 """
-Big W AU — Product Discovery
-==============================
-Discovers TCG product URLs from Big W AU.
+Target AU — Product Discovery
+===============================
+Discovers TCG product URLs from Target Australia.
 
 Strategy (three-pass):
-  1. Big W search API — Big W exposes a JSON search endpoint used by
-     their Next.js frontend. Returns structured product data without JS.
-  2. Raw HTTP + BeautifulSoup — parses __NEXT_DATA__ and product tiles
-     from server-rendered HTML.
+  1. Target AU search API — Target exposes a JSON search endpoint used
+     by their Next.js frontend. Returns structured product data without JS.
+  2. Raw HTTP + BeautifulSoup — parses __NEXT_DATA__ and product tiles.
   3. Playwright with persistent context — full JS rendering as last resort.
 
 Usage:
-    python discovery/bigw_discovery.py --tcg pokemon --dry-run
-    python discovery/bigw_discovery.py --tcg pokemon --dry-run --headed
+    python discovery/target_discovery.py --tcg pokemon --dry-run
+    python discovery/target_discovery.py --tcg pokemon --dry-run --headed
 
 Setup:
     pip install playwright beautifulsoup4 lxml requests python-dotenv
@@ -66,28 +65,28 @@ logger = logging.getLogger(__name__)
 
 SESSION = make_session()
 
-# Big W category + search URLs per TCG (fallback if API unavailable)
-BIGW_CATEGORY_URLS = {
+# Target category + search URLs per TCG (fallback if API unavailable)
+TARGET_CATEGORY_URLS = {
     "pokemon": [
-        "https://www.bigw.com.au/toys-outdoor-sport/toys/games-puzzles-cards/trading-card-games/cat/cat_17680",
-        "https://www.bigw.com.au/search?q=pokemon+trading+card",
+        "https://www.target.com.au/c/toys-and-games/games-and-puzzles/trading-card-games",
+        "https://www.target.com.au/search?q=pokemon+trading+card",
     ],
     "one-piece": [
-        "https://www.bigw.com.au/search?q=one+piece+trading+card",
+        "https://www.target.com.au/search?q=one+piece+trading+card",
     ],
     "mtg": [
-        "https://www.bigw.com.au/search?q=magic+the+gathering+trading+card",
+        "https://www.target.com.au/search?q=magic+the+gathering+trading+card",
     ],
     "dragon-ball-z": [
-        "https://www.bigw.com.au/search?q=dragon+ball+super+card+game",
+        "https://www.target.com.au/search?q=dragon+ball+super+card+game",
     ],
     "lorcana": [
-        "https://www.bigw.com.au/search?q=disney+lorcana+trading+card",
+        "https://www.target.com.au/search?q=disney+lorcana+trading+card",
     ],
 }
 
 # Search query strings per TCG for the API
-BIGW_TCG_QUERIES = {
+TARGET_TCG_QUERIES = {
     "pokemon": "pokemon trading card",
     "one-piece": "one piece trading card",
     "mtg": "magic the gathering trading card",
@@ -96,22 +95,22 @@ BIGW_TCG_QUERIES = {
 }
 
 
-# ─── Strategy 1: Big W Search API ────────────────────────────────────
+# ─── Strategy 1: Target Search API ───────────────────────────────────
 
-def scrape_bigw_api(tcg: str) -> list[dict]:
+def scrape_target_api(tcg: str) -> list[dict]:
     """
-    Query Big W's internal search API (used by their Next.js frontend).
+    Query Target AU's internal search API (used by their Next.js frontend).
 
-    Big W exposes a public JSON search endpoint. Paginated by default.
-    Returns a flat list of raw product dicts.
+    Target exposes a public JSON endpoint. Tries several known endpoint
+    patterns and falls back gracefully.
     """
-    query = BIGW_TCG_QUERIES.get(tcg, f"{tcg} trading card")
+    query = TARGET_TCG_QUERIES.get(tcg, f"{tcg} trading card")
 
-    # Big W Next.js API route — discovered by inspecting XHR on search page
-    # May need updating if Big W changes their API endpoint
+    # Target AU API endpoints — discovered by inspecting XHR on their search page
     endpoints = [
-        "https://www.bigw.com.au/api/2.0/page/search",
-        "https://www.bigw.com.au/api/page/search",
+        "https://www.target.com.au/api/2.0/page/search",
+        "https://www.target.com.au/api/page/search",
+        "https://api.target.com.au/v2/search",
     ]
 
     products = []
@@ -134,10 +133,10 @@ def scrape_bigw_api(tcg: str) -> list[dict]:
                 resp.raise_for_status()
                 data = resp.json()
 
-                # Extract product list from various possible response shapes
                 items = (
                     data.get("products", [])
                     or data.get("results", {}).get("products", [])
+                    or data.get("searchResults", {}).get("products", [])
                     or data.get("data", {}).get("products", [])
                     or []
                 )
@@ -155,16 +154,15 @@ def scrape_bigw_api(tcg: str) -> list[dict]:
                         item.get("price")
                     )
                     image_url = (
-                        item.get("image") or
-                        item.get("imageUrl") or
-                        item.get("media", [{}])[0].get("url", "") if item.get("media") else ""
+                        item.get("image") or item.get("imageUrl") or
+                        (item.get("media", [{}])[0].get("url", "") if item.get("media") else "")
                     )
 
                     if not name or not url_path:
                         continue
 
                     full_url = (
-                        "https://www.bigw.com.au" + url_path
+                        "https://www.target.com.au" + url_path
                         if url_path.startswith("/") else url_path
                     )
                     full_url = full_url.split("?")[0]
@@ -185,7 +183,7 @@ def scrape_bigw_api(tcg: str) -> list[dict]:
                     data.get("totalPages") or
                     data.get("pagination", {}).get("totalPages") or 1
                 )
-                logger.info(f"  Big W API page {page}/{total_pages}")
+                logger.info(f"  Target API page {page}/{total_pages}")
 
                 if page >= total_pages or page >= 5:
                     break
@@ -193,16 +191,16 @@ def scrape_bigw_api(tcg: str) -> list[dict]:
                 time.sleep(0.5)
 
             if products:
-                logger.info(f"  ✅ Found {len(products)} via Big W API")
+                logger.info(f"  ✅ Found {len(products)} via Target API")
                 return products
 
         except requests.HTTPError as e:
             if e.response.status_code == 404:
                 continue  # Try next endpoint
-            logger.warning(f"  Big W API error: {e}")
+            logger.warning(f"  Target API error: {e}")
             break
         except Exception as e:
-            logger.debug(f"  Big W API ({base_url}) failed: {e}")
+            logger.debug(f"  Target API ({base_url}) failed: {e}")
             continue
 
     return products
@@ -212,15 +210,16 @@ def scrape_bigw_api(tcg: str) -> list[dict]:
 
 def parse_products_from_html(html: str) -> list[dict]:
     """
-    Parse product tiles from Big W HTML.
+    Parse product tiles from Target AU HTML.
 
     Tries __NEXT_DATA__ JSON first, then article-based tile scraping.
+    Product URL pattern: target.com.au/p/NAME/XXXXXXXX
     """
     soup = BeautifulSoup(html, "lxml")
     seen: set[str] = set()
     products = []
 
-    # Try __NEXT_DATA__ JSON (embedded by Next.js on server render)
+    # Try __NEXT_DATA__
     next_data_script = soup.select_one("script#__NEXT_DATA__")
     if next_data_script and next_data_script.string:
         try:
@@ -234,8 +233,8 @@ def parse_products_from_html(html: str) -> list[dict]:
             )
             for item in items:
                 name = item.get("name") or item.get("title", "")
-                url_path = item.get("slug") or item.get("urlPath", "")
-                sku = str(item.get("id") or item.get("sku", ""))
+                url_path = item.get("url") or item.get("urlPath") or item.get("slug", "")
+                sku = str(item.get("id") or item.get("productId") or item.get("sku", ""))
                 price_raw = item.get("price", {})
                 price_num = (
                     price_raw.get("current", {}).get("value") or price_raw.get("amount")
@@ -246,11 +245,10 @@ def parse_products_from_html(html: str) -> list[dict]:
 
                 if not name:
                     continue
-                if url_path:
-                    href = "https://www.bigw.com.au" + url_path if url_path.startswith("/") else url_path
-                elif sku:
-                    href = f"https://www.bigw.com.au/product/p/{sku}"
-                else:
+                href = (
+                    "https://www.target.com.au" + url_path if url_path.startswith("/") else url_path
+                ) if url_path else (f"https://www.target.com.au/p/{sku}" if sku else "")
+                if not href:
                     continue
 
                 href = href.split("?")[0]
@@ -269,10 +267,12 @@ def parse_products_from_html(html: str) -> list[dict]:
         except (json.JSONDecodeError, AttributeError, TypeError, IndexError):
             pass
 
-    # HTML tile fallback
+    # HTML tile fallback — Target uses similar patterns to Big W/Kmart
     tile_selectors = [
         "article[data-testid='product-tile']",
         "[data-testid='product-tile']",
+        "article[data-testid='product-card']",
+        "[data-testid='product-card']",
         "article",
         ".product-tile",
     ]
@@ -284,14 +284,19 @@ def parse_products_from_html(html: str) -> list[dict]:
             break
 
     for tile in tiles:
-        link = tile.select_one('a[href*="/product/"]') or tile.select_one("a")
+        # Target product URLs use /p/ path
+        link = (
+            tile.select_one('a[href*="/p/"]')
+            or tile.select_one('a[href*="/product/"]')
+            or tile.select_one("a")
+        )
         if not link:
             continue
         href = link.get("href", "")
-        if not href or "/product/" not in href:
+        if not href or ("/p/" not in href and "/product/" not in href):
             continue
         if href.startswith("/"):
-            href = "https://www.bigw.com.au" + href
+            href = "https://www.target.com.au" + href
         href = href.split("?")[0]
         if href in seen:
             continue
@@ -299,9 +304,9 @@ def parse_products_from_html(html: str) -> list[dict]:
 
         name = ""
         name_el = (
-            tile.select_one("[data-testid='product-title']")
-            or tile.select_one("h3") or tile.select_one("h2")
-            or tile.select_one("[class*='title']") or tile.select_one("[class*='name']")
+            tile.select_one("[data-testid='product-title']") or tile.select_one("h3")
+            or tile.select_one("h2") or tile.select_one("[class*='title']")
+            or tile.select_one("[class*='name']")
         )
         if name_el:
             name = name_el.get_text(strip=True)
@@ -352,16 +357,22 @@ EXTRACT_JS = """
 () => {
     const seen = new Set();
     const products = [];
-    const selectors = ["article[data-testid='product-tile']", "[data-testid='product-tile']", "article", ".product-tile"];
+    const selectors = [
+        "article[data-testid='product-tile']", "[data-testid='product-tile']",
+        "article[data-testid='product-card']", "[data-testid='product-card']",
+        "article", ".product-tile",
+    ];
     let tiles = [];
     for (const sel of selectors) {
         const found = document.querySelectorAll(sel);
         if (found.length > 0) { tiles = Array.from(found); break; }
     }
     tiles.forEach(tile => {
-        const link = tile.querySelector('a[href*="/product/"]') || tile.querySelector('a');
-        if (!link || !link.href.includes('/product/')) return;
-        const href = link.href.split('?')[0];
+        const link = tile.querySelector('a[href*="/p/"]') || tile.querySelector('a[href*="/product/"]') || tile.querySelector('a');
+        if (!link) return;
+        const href_raw = link.href || '';
+        if (!href_raw.includes('/p/') && !href_raw.includes('/product/')) return;
+        const href = href_raw.split('?')[0];
         if (!href || seen.has(href)) return;
         seen.add(href);
         const nameEl = tile.querySelector("[data-testid='product-title'], h3, h2, [class*='title'], [class*='name']");
@@ -442,7 +453,26 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
     name = raw.get("name", "").strip()
     url = raw.get("url", "").strip()
 
-    if not apply_filters(name, url, "bigw.com.au", "/product/", tcg):
+    # Target uses /p/ path segments
+    if not name or not url:
+        return None
+    if "target.com.au" not in url:
+        return None
+    if "/p/" not in url and "/product/" not in url:
+        return None
+
+    name_lower = name.lower()
+    keywords = TCG_NAME_KEYWORDS.get(tcg, [tcg.lower()])
+    if not any(kw in name_lower for kw in keywords):
+        return None
+
+    for blocked in PRODUCT_BLOCKLIST:
+        if blocked in name_lower:
+            logger.debug(f"  Blocked '{blocked}': {name}")
+            return None
+
+    if not any(allowed in name_lower for allowed in PRODUCT_ALLOWLIST):
+        logger.debug(f"  Not in allowlist: {name}")
         return None
 
     set_key = infer_set(name) if tcg == "pokemon" else None
@@ -452,7 +482,7 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
         "name": name,
         "set": set_key or tcg,
         "tcg": tcg,
-        "retailer": "bigw_au",
+        "retailer": "target_au",
         "price": raw.get("price_raw") or parse_price(raw.get("price", "")),
         "price_str": raw.get("price") or None,
         "image": raw.get("image") or "",
@@ -460,26 +490,26 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
         "is_preorder": raw.get("is_preorder", False),
         "in_stock": False,
         "discovered_at": datetime.now().isoformat(),
-        "source": "bigw_discovery",
+        "source": "target_discovery",
     }
 
 
 # ─── Main Discovery Flow ─────────────────────────────────────────────
 
-def discover_bigw(tcg_filter: Optional[str] = None, dry_run: bool = False,
-                  fetch_images: bool = True, headed: bool = False) -> list[dict]:
-    """Run the full Big W AU product discovery flow."""
+def discover_target(tcg_filter: Optional[str] = None, dry_run: bool = False,
+                    fetch_images: bool = True, headed: bool = False) -> list[dict]:
+    """Run the full Target AU product discovery flow."""
     all_products: list[dict] = []
     seen_urls: set[str] = set()
 
-    categories = BIGW_CATEGORY_URLS
+    categories = TARGET_CATEGORY_URLS
     if tcg_filter:
         categories = {k: v for k, v in categories.items() if k == tcg_filter}
         if not categories:
-            logger.error(f"Unknown TCG: {tcg_filter}. Options: {list(BIGW_CATEGORY_URLS)}")
+            logger.error(f"Unknown TCG: {tcg_filter}. Options: {list(TARGET_CATEGORY_URLS)}")
             return []
 
-    logger.info("🔍 Starting Big W AU discovery")
+    logger.info("🔍 Starting Target AU discovery")
     logger.info(f"   TCG: {tcg_filter or 'all'}")
     logger.info(f"   Mode: {'DRY RUN' if dry_run else 'LIVE'}")
     logger.info("")
@@ -489,8 +519,8 @@ def discover_bigw(tcg_filter: Optional[str] = None, dry_run: bool = False,
 
         raw_products: list[dict] = []
 
-        # Strategy 1: Big W search API
-        raw_products = scrape_bigw_api(tcg)
+        # Strategy 1: Target API
+        raw_products = scrape_target_api(tcg)
 
         # Strategy 2 & 3: Scraping fallback
         if not raw_products:
@@ -527,15 +557,15 @@ def discover_bigw(tcg_filter: Optional[str] = None, dry_run: bool = False,
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    parser = argparse.ArgumentParser(description="Big W AU — TCG product discovery")
+    parser = argparse.ArgumentParser(description="Target AU — TCG product discovery")
     parser.add_argument("--dry-run", action="store_true", help="Don't save to DB")
     parser.add_argument("--tcg", default=None,
-                        help=f"TCG to discover. Options: {', '.join(BIGW_CATEGORY_URLS)}")
+                        help=f"TCG to discover. Options: {', '.join(TARGET_CATEGORY_URLS)}")
     parser.add_argument("--no-images", action="store_true", help="Skip image fetching")
     parser.add_argument("--headed", action="store_true", help="Run browser in headed mode")
     args = parser.parse_args()
 
-    discover_bigw(
+    discover_target(
         tcg_filter=args.tcg,
         dry_run=args.dry_run,
         fetch_images=not args.no_images,
