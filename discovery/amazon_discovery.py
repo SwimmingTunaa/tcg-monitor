@@ -72,15 +72,19 @@ logger = logging.getLogger(__name__)
 
 # ─── Configuration ───────────────────────────────────────────────────
 
+# Price bounds — filters out single loose packs (<$25) and scalper-priced
+# old listings (>$600) that aren't useful for stock monitoring
+MIN_PRICE = 25.0
+MAX_PRICE = 600.0
+
 # Max search result pages to scrape per query (3 × ~16 results = ~48 products)
 MAX_PAGES = 3
 
 # Amazon search URLs per TCG — multiple queries per TCG to catch more products
 AMAZON_SEARCH_URLS: dict[str, list[str]] = {
     "pokemon": [
-        "https://www.amazon.com.au/s?k=pokemon+trading+card+game+booster+box",
+        "https://www.amazon.com.au/s?k=pokemon+TCG",
         "https://www.amazon.com.au/s?k=pokemon+tcg+elite+trainer+box",
-        "https://www.amazon.com.au/s?k=pokemon+trading+card+collection+tin",
     ],
     "one-piece": [
         "https://www.amazon.com.au/s?k=one+piece+trading+card+game+booster+box",
@@ -105,13 +109,21 @@ EXTRACT_JS = """
     const seen = new Set();
     const products = [];
 
-    // Amazon search result items — selector is stable across layouts
-    const tiles = document.querySelectorAll(
-        '.s-result-item[data-component-type="s-search-result"]'
-    );
+    // Amazon AU new grid layout — tiles are div.s-widget-container with data-csa-c-item-id
+    // ASIN lives on the inner div[data-asin] (add-to-cart form), not the outer wrapper
+    const tiles = document.querySelectorAll('div.s-widget-container[data-csa-c-item-id]');
 
     tiles.forEach(tile => {
-        const asin = tile.getAttribute('data-asin');
+        // Extract ASIN — prefer inner div[data-asin] (tiles with add-to-cart),
+        // fall back to data-csa-c-item-id on the outer tile (e.g. "no featured offers" ETBs)
+        const asinEl = tile.querySelector('div[data-asin]');
+        let asin = asinEl ? asinEl.getAttribute('data-asin') : '';
+        if (!asin || asin.trim() === '') {
+            // data-csa-c-item-id format: "MAIN-SEARCH_RESULTS-3|B0XXXX|..." or just the ASIN
+            const itemId = tile.getAttribute('data-csa-c-item-id') || '';
+            const asinMatch = itemId.match(/\\b([A-Z0-9]{10})\\b/);
+            asin = asinMatch ? asinMatch[1] : '';
+        }
         if (!asin || asin.trim() === '') return;
 
         // Normalise URL to /dp/ASIN to avoid duplicate variations
@@ -119,12 +131,14 @@ EXTRACT_JS = """
         if (seen.has(url)) return;
         seen.add(url);
 
-        // Product name
-        const nameEl = tile.querySelector('h2 .a-text-normal, h2 a span, .a-size-medium.a-color-base');
+        // Product name — h2.a-size-base-plus > span in new layout
+        const nameEl = tile.querySelector(
+            'h2.a-size-base-plus span, h2 a span, h2 .a-text-normal'
+        );
         const name = nameEl ? nameEl.textContent.trim() : '';
         if (!name) return;
 
-        // Price — Amazon splits into whole + fraction parts
+        // Price — .a-offscreen inside .a-price (unchanged, still works)
         let priceStr = '';
         let priceNum = null;
         const priceEl = tile.querySelector('.a-price .a-offscreen');
@@ -137,27 +151,25 @@ EXTRACT_JS = """
             }
         }
 
-        // Product image
+        // Product image (unchanged)
         const img = tile.querySelector('img.s-image');
         const imageUrl = img ? img.src : '';
 
-        // Check for "Sponsored" label — still valid to track but note it
+        // Sponsored label (unchanged)
         const isSponsored = !!tile.querySelector('.s-sponsored-label-info-icon, [data-component-type="s-sponsored-placements"]');
 
-        if (name) {
-            products.push({
-                name,
-                url,
-                asin,
-                price: priceStr,
-                price_raw: priceNum,
-                sku: asin,
-                image: imageUrl,
-                is_preorder: name.toLowerCase().includes('pre-order') || name.toLowerCase().includes('coming soon'),
-                is_sponsored: isSponsored,
-                promo: isSponsored ? 'Sponsored' : '',
-            });
-        }
+        products.push({
+            name,
+            url,
+            asin,
+            price: priceStr,
+            price_raw: priceNum,
+            sku: asin,
+            image: imageUrl,
+            is_preorder: name.toLowerCase().includes('pre-order') || name.toLowerCase().includes('coming soon'),
+            is_sponsored: isSponsored,
+            promo: isSponsored ? 'Sponsored' : '',
+        });
     });
 
     return products;
@@ -197,10 +209,10 @@ def scrape_search_page(base_url: str, headed: bool = False) -> list[dict]:
                     logger.warning(f"  Timeout on page {page_num} — stopping pagination")
                     break
 
-                # Wait for search results to appear
+                # Wait for search results to appear (new Amazon AU grid layout)
                 try:
                     page.wait_for_selector(
-                        '.s-result-item[data-component-type="s-search-result"]',
+                        'div.s-widget-container[data-csa-c-item-id]',
                         timeout=15000
                     )
                 except PlaywrightTimeout:
@@ -210,6 +222,31 @@ def scrape_search_page(base_url: str, headed: bool = False) -> list[dict]:
                 # Scroll to trigger lazy-loaded images
                 page.evaluate(SCROLL_JS)
                 page.wait_for_timeout(1500)
+
+                # ── DEBUG: inspect raw tile structure ──────────────────
+                debug_info = page.evaluate("""
+                () => {
+                    const tiles = document.querySelectorAll('div.s-widget-container[data-csa-c-item-id]');
+                    const samples = [];
+                    tiles.forEach((tile, i) => {
+                        if (i >= 3) return;
+                        const asinEl = tile.querySelector('div[data-asin]');
+                        const nameEl = tile.querySelector('h2.a-size-base-plus span, h2 a span, h2 .a-text-normal');
+                        samples.push({
+                            index: i,
+                            asin: asinEl ? asinEl.getAttribute('data-asin') : '(no div[data-asin])',
+                            name: nameEl ? nameEl.textContent.trim().slice(0, 80) : '(no name el)',
+                            outerSnippet: tile.outerHTML.slice(0, 200),
+                        });
+                    });
+                    return { tileCount: tiles.length, samples };
+                }
+                """)
+                logger.info(f"  [DEBUG] Tiles found: {debug_info['tileCount']}")
+                for s in debug_info['samples']:
+                    logger.info(f"  [DEBUG] Tile {s['index']}: asin={s['asin']!r} name={s['name']!r}")
+                    logger.info(f"  [DEBUG] HTML snippet: {s['outerSnippet']!r}")
+                # ── END DEBUG ─────────────────────────────────────────
 
                 # Extract products
                 products = page.evaluate(EXTRACT_JS)
@@ -273,6 +310,15 @@ def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
         return None
 
     set_key = infer_set(name) if tcg == "pokemon" else None
+
+    price_val = raw.get("price_raw") or parse_price(raw.get("price", ""))
+    if price_val is not None:
+        if price_val < MIN_PRICE:
+            logger.debug(f"  Below min price ${MIN_PRICE}: {name} (${price_val})")
+            return None
+        if price_val > MAX_PRICE:
+            logger.debug(f"  Above max price ${MAX_PRICE}: {name} (${price_val})")
+            return None
 
     return {
         "url": url,

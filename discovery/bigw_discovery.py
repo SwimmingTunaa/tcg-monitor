@@ -69,8 +69,8 @@ SESSION = make_session()
 # Big W category + search URLs per TCG (fallback if API unavailable)
 BIGW_CATEGORY_URLS = {
     "pokemon": [
-        "https://www.bigw.com.au/toys-outdoor-sport/toys/games-puzzles-cards/trading-card-games/cat/cat_17680",
-        "https://www.bigw.com.au/search?q=pokemon+trading+card",
+        "https://www.bigw.com.au/toys/trading-cards/pokemon-trading-cards/c/681510201",
+        "https://www.bigw.com.au/search?text=pokemon+tcg",
     ],
     "one-piece": [
         "https://www.bigw.com.au/search?q=one+piece+trading+card",
@@ -299,12 +299,15 @@ def parse_products_from_html(html: str) -> list[dict]:
 
         name = ""
         name_el = (
-            tile.select_one("[data-testid='product-title']")
+            tile.select_one("p#product-tile-product-name")
+            or tile.select_one("[data-testid='product-title']")
             or tile.select_one("h3") or tile.select_one("h2")
             or tile.select_one("[class*='title']") or tile.select_one("[class*='name']")
         )
         if name_el:
             name = name_el.get_text(strip=True)
+        if not name:
+            name = tile.get("aria-label", "").strip()
         if not name:
             img = tile.select_one("img")
             if img:
@@ -364,8 +367,9 @@ EXTRACT_JS = """
         const href = link.href.split('?')[0];
         if (!href || seen.has(href)) return;
         seen.add(href);
-        const nameEl = tile.querySelector("[data-testid='product-title'], h3, h2, [class*='title'], [class*='name']");
+        const nameEl = tile.querySelector("p#product-tile-product-name, [data-testid='product-title'], h3, h2, [class*='title'], [class*='name']");
         let name = nameEl ? nameEl.textContent.trim() : '';
+        if (!name) { name = tile.getAttribute('aria-label') || ''; }
         if (!name) { const img = tile.querySelector('img'); name = img ? (img.alt || '') : ''; }
         const priceEl = tile.querySelector("[data-testid='product-price'], [class*='price'], [class*='Price']");
         let priceStr = ''; let priceNum = null;

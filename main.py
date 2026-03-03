@@ -97,7 +97,10 @@ def monitor_loop(monitor, products: list[dict]):
 
 
 def run_test_mode(db: Database, retailers: list[str] = None):
-    """Run a single check cycle for testing (no loop)."""
+    """Run a single check cycle for testing (no loop).
+    Uses check_product so change detection and Discord alerts fire normally,
+    but all alerts are routed to the test channel via TEST_MODE.
+    """
     logger.info("=== TEST MODE — Single check cycle ===")
 
     for retailer_key, monitor_class in MONITOR_CLASSES.items():
@@ -111,13 +114,7 @@ def run_test_mode(db: Database, retailers: list[str] = None):
 
         monitor = monitor_class(db)
         logger.info(f"[{retailer_key}] Checking {len(products)} products...")
-
-        for product in products:
-            status = monitor.scrape_product(product["url"])
-            if status:
-                logger.info(f"  {status}")
-            else:
-                logger.warning(f"  Failed to scrape: {product['name']}")
+        monitor.run_cycle(products)
 
     logger.info("=== Test cycle complete ===")
 
@@ -135,6 +132,11 @@ def main():
     db.cleanup_old_data(days=90)
 
     if args.test:
+        import config.settings as _settings
+        _settings.TEST_MODE = True
+        import utils.discord as _discord
+        _discord.TEST_MODE = True
+        logger.info("🧪 TEST MODE — alerts will fire to the test Discord channel")
         run_test_mode(db, args.retailers)
         return
 

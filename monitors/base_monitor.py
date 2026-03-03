@@ -56,6 +56,51 @@ class BaseMonitor(ABC):
 
         return retry_with_backoff(_fetch, max_retries=2)
 
+    def fetch_page_playwright(
+        self,
+        url: str,
+        wait_for_selector: Optional[str] = None,
+        timeout: int = 30_000,
+        headed: bool = False,
+    ) -> Optional[str]:
+        """
+        Fetch a URL using Playwright with the shared persistent browser profile.
+        Returns the page HTML as a string, or None on failure / missing Playwright.
+        """
+        try:
+            from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+        except ImportError:
+            logger.debug("Playwright not installed — skipping browser fallback")
+            return None
+
+        from discovery.base_discovery import STEALTH_JS, BROWSER_PROFILE_DIR, make_playwright_context
+        import os
+
+        try:
+            with sync_playwright() as p:
+                context = make_playwright_context(
+                    p, headed=headed,
+                    profile_dir=os.path.abspath(BROWSER_PROFILE_DIR),
+                )
+                context.add_init_script(STEALTH_JS)
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                    if wait_for_selector:
+                        try:
+                            page.wait_for_selector(wait_for_selector, timeout=timeout)
+                        except PlaywrightTimeout:
+                            logger.warning(
+                                f"Playwright: selector '{wait_for_selector}' not found on {url}"
+                            )
+                    return page.content()
+                finally:
+                    page.close()
+                    context.close()
+        except Exception as e:
+            logger.warning(f"Playwright fetch failed for {url}: {e}")
+            return None
+
     @abstractmethod
     def scrape_product(self, url: str) -> Optional[ProductStatus]:
         """

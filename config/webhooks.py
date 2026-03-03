@@ -56,3 +56,6 @@ PRICE_DROP_WEBHOOK = "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE"
 
 # Error/status channel for monitor health
 STATUS_WEBHOOK = "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE"
+
+# Testing channel — used when running in --test mode
+TEST_WEBHOOK = "https://discord.com/api/webhooks/1477289111231533129/D2BGZpYvQY_k6l1aT-_MUOYDuydJeq_m49vxIZ2k0InefmQnMU0NlwHtwnxCZT7y72W5"

@@ -13,6 +13,39 @@ Add as many products as you like. The monitor will cycle through them
 at the interval configured for each retailer.
 """
 
+# ─── Database import (lazy, to avoid circular imports) ─────────────
+def _get_db_products(retailer: str) -> list[dict]:
+    """Read discovered products from the database for a given retailer."""
+    try:
+        from utils.database import Database
+        db = Database()
+        conn = db._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT ps.url, ps.name, ps.retailer, ps.image_url, "
+                "       cp.set_key, cp.tcg "
+                "FROM product_status ps "
+                "LEFT JOIN canonical_products cp ON ps.canonical_id = cp.id "
+                "WHERE ps.retailer = ?",
+                (retailer,)
+            ).fetchall()
+            return [
+                {
+                    "url": row["url"],
+                    "name": row["name"],
+                    "retailer": row["retailer"],
+                    "image": row["image_url"] or "",
+                    "set": row["set_key"] or "general",
+                    "tcg": row["tcg"] or "pokemon",
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
 PRODUCTS = [
     # ─── Amazon AU — Pokémon ─────────────────────────────────────────
     {
@@ -37,16 +70,6 @@ PRODUCTS = [
         "set": "prismatic-evolutions",
         "tcg": "pokemon",
         "retailer": "amazon_au",
-        "image": "",
-    },
-
-    # ─── EB Games AU — Pokémon ───────────────────────────────────────
-    {
-        "url": "https://www.ebgames.com.au/product/trading-cards/example-journey-together-etb",
-        "name": "Pokémon TCG: Journey Together ETB",
-        "set": "journey-together",
-        "tcg": "pokemon",
-        "retailer": "ebgames_au",
         "image": "",
     },
 
@@ -94,8 +117,16 @@ PRODUCTS = [
 
 
 def get_products_by_retailer(retailer: str) -> list[dict]:
-    """Get all products for a specific retailer."""
-    return [p for p in PRODUCTS if p["retailer"] == retailer]
+    """Get all products for a specific retailer.
+    Merges hardcoded PRODUCTS with products discovered and saved to the DB.
+    """
+    hardcoded = [p for p in PRODUCTS if p["retailer"] == retailer]
+    db_products = _get_db_products(retailer)
+
+    # Merge: hardcoded takes priority, DB fills in the rest
+    seen_urls = {p["url"] for p in hardcoded}
+    merged = hardcoded + [p for p in db_products if p["url"] not in seen_urls]
+    return merged
 
 
 def get_products_by_set(set_name: str) -> list[dict]:

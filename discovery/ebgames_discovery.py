@@ -160,19 +160,29 @@ PRODUCT_BLOCKLIST = [
 ]
 
 # Known Pokémon sets for auto-tagging
+# Order matters — more specific phrases should come before generic ones
 POKEMON_SETS = {
-    "journey together": "journey-together",
+    # Scarlet & Violet era
+    "scarlet & violet: journey together": "journey-together",
+    "scarlet & violet: destined rivals":  "destined-rivals",
+    "scarlet & violet: prismatic evolutions": "prismatic-evolutions",
+    "scarlet & violet: surging sparks":   "surging-sparks",
+    "scarlet & violet: paldean fates":    "paldean-fates",
+    "scarlet & violet: ascended heroes":  "ascended-heroes",
+    "scarlet & violet: phantasmal flames": "phantasmal-flames",
+    # Generic set name matches (fallback)
+    "journey together":     "journey-together",
     "prismatic evolutions": "prismatic-evolutions",
-    "surging sparks": "surging-sparks",
-    "paldean fates": "paldean-fates",
-    "pokemon 151": "pokemon-151",
-    "pokémon 151": "pokemon-151",
-    "destined rivals": "destined-rivals",
-    "perfect order": "perfect-order",
-    "ascended heroes": "ascended-heroes",
-    "phantasmal flames": "phantasmal-flames",
-    "mega evolutions": "mega-evolutions",
-    "mega evolution": "mega-evolutions",
+    "surging sparks":       "surging-sparks",
+    "paldean fates":        "paldean-fates",
+    "pokemon 151":          "pokemon-151",
+    "pok\u00e9mon 151":         "pokemon-151",
+    "destined rivals":      "destined-rivals",
+    "perfect order":        "perfect-order",
+    "ascended heroes":      "ascended-heroes",
+    "phantasmal flames":    "phantasmal-flames",
+    "mega evolutions":      "mega-evolutions",
+    "mega evolution":       "mega-evolutions",
 }
 
 # Headers for raw HTTP requests

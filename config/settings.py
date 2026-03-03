@@ -32,6 +32,10 @@ ALERT_COOLDOWN = 1800  # 30 minutes
 # Alert on price drops greater than this percentage
 PRICE_DROP_THRESHOLD = 5.0  # percent
 
+# ─── Test mode ────────────────────────────────────────────────────
+# When True, all alerts route to TEST_WEBHOOK instead of real channels
+TEST_MODE = False
+
 # ─── Logging ─────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
