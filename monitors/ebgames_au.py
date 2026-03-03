@@ -128,6 +128,7 @@ class EBGamesAUMonitor(BaseMonitor):
             price=price,
             price_str=price_str,
             stock_text=stock_text,
+            preorder=(is_preorder_schema or is_preorder_btn),
             image_url=image_url,
         )
 

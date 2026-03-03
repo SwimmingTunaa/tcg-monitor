@@ -80,6 +80,7 @@ class AmazonAUMonitor(BaseMonitor):
         # ── Stock Status ─────────────────────────────────────────────
         in_stock = False
         stock_text = "Unknown"
+        is_preorder = False
 
         avail_div = soup.find("div", {"id": "availability"})
         if avail_div:
@@ -90,6 +91,7 @@ class AmazonAUMonitor(BaseMonitor):
                 in_stock = True
             elif "pre-order" in avail_text or "preorder" in avail_text:
                 in_stock = True
+                is_preorder = True
                 stock_text = "Pre-order"
             elif any(kw in avail_text for kw in [
                 "currently unavailable", "out of stock",
@@ -129,5 +131,6 @@ class AmazonAUMonitor(BaseMonitor):
             price=price,
             price_str=price_str,
             stock_text=stock_text,
+            preorder=is_preorder,
             image_url=image_url,
         )

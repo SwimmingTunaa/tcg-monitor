@@ -86,6 +86,7 @@ class BigWAUMonitor(BaseMonitor):
         # ── Stock Status ─────────────────────────────────────────────
         in_stock = False
         stock_text = "Unknown"
+        is_preorder = False
 
         # From JSON-LD
         availability = offers.get("availability", "").lower()
@@ -98,6 +99,7 @@ class BigWAUMonitor(BaseMonitor):
         elif "preorder" in availability:
             in_stock = True
             stock_text = "Pre-order"
+            is_preorder = True
 
         # Fallback to HTML elements
         if stock_text == "Unknown":
@@ -128,5 +130,6 @@ class BigWAUMonitor(BaseMonitor):
             price=price,
             price_str=price_str,
             stock_text=stock_text,
+            preorder=is_preorder,
             image_url=image_url,
         )

@@ -86,6 +86,7 @@ class TargetAUMonitor(BaseMonitor):
         # ── Stock Status ─────────────────────────────────────────────
         in_stock = False
         stock_text = "Unknown"
+        is_preorder = False
 
         availability = offers.get("availability", "").lower()
         if "instock" in availability:
@@ -97,6 +98,7 @@ class TargetAUMonitor(BaseMonitor):
         elif "preorder" in availability:
             in_stock = True
             stock_text = "Pre-order"
+            is_preorder = True
 
         if stock_text == "Unknown":
             add_btn = soup.find("button", string=re.compile(r"add to (cart|trolley|bag)", re.I))
@@ -125,5 +127,6 @@ class TargetAUMonitor(BaseMonitor):
             price=price,
             price_str=price_str,
             stock_text=stock_text,
+            preorder=is_preorder,
             image_url=image_url,
         )

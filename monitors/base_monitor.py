@@ -16,6 +16,7 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+import config.settings as settings
 from config.settings import DEFAULT_POLL_INTERVAL, POLL_INTERVALS, PRICE_DROP_THRESHOLD
 from utils.helpers import (
     ProductStatus, StockChange,
@@ -186,8 +187,13 @@ class BaseMonitor(ABC):
 
     def check_product(self, product: dict):
         """Check a single product and alert if status changed."""
-        url = product["url"]
-        name = product["name"]
+        raw_url = product.get("url")
+        url = raw_url.strip() if isinstance(raw_url, str) else ""
+        name = product.get("name", "Unknown Product")
+
+        if not url:
+            logger.debug(f"Skipping product with missing URL: {name}")
+            return
 
         logger.debug(f"Checking: {name} @ {self.retailer_name}")
 
@@ -222,11 +228,17 @@ class BaseMonitor(ABC):
 
     def run_cycle(self, products: list[dict]):
         """Run one check cycle across all products for this retailer."""
-        for product in products:
+        total = len(products)
+        for idx, product in enumerate(products, 1):
+            if settings.TEST_MODE:
+                name = product.get("name", "Unknown Product")
+                logger.info(f"[{self.retailer_key}] Progress {idx}/{total}: {name}")
             try:
                 self.check_product(product)
             except Exception as e:
-                logger.error(f"Error checking {product['name']}: {e}", exc_info=True)
+                name = product.get("name", "Unknown Product")
+                logger.error(f"Error checking {name}: {e}", exc_info=True)
 
             # Small delay between products to avoid hammering
-            time.sleep(jitter(2.0))
+            if not settings.TEST_MODE:
+                time.sleep(jitter(2.0))

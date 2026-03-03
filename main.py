@@ -22,8 +22,8 @@ from datetime import datetime
 from config.settings import LOG_LEVEL, LOG_FORMAT
 from config.products import get_products_by_retailer, PRODUCTS
 from utils.database import Database
-from utils.discord import send_status_message
-from utils.helpers import jitter
+from utils.discord import send_status_message, send_stock_alert
+from utils.helpers import jitter, StockChange
 
 # Import all monitors
 from monitors.amazon_au import AmazonAUMonitor
@@ -96,7 +96,12 @@ def monitor_loop(monitor, products: list[dict]):
     logger.info(f"[{retailer}] Monitor loop stopped")
 
 
-def run_test_mode(db: Database, retailers: list[str] = None):
+def run_test_mode(
+    db: Database,
+    retailers: list[str] = None,
+    force_alert_test: bool = False,
+    force_alert_limit: int = 1,
+):
     """Run a single check cycle for testing (no loop).
     Uses check_product so change detection and Discord alerts fire normally,
     but all alerts are routed to the test channel via TEST_MODE.
@@ -108,13 +113,56 @@ def run_test_mode(db: Database, retailers: list[str] = None):
             continue
 
         products = get_products_by_retailer(retailer_key)
+        products = [p for p in products if isinstance(p.get("url"), str) and p.get("url").strip()]
         if not products:
             logger.info(f"[{retailer_key}] No products configured, skipping")
             continue
 
         monitor = monitor_class(db)
         logger.info(f"[{retailer_key}] Checking {len(products)} products...")
-        monitor.run_cycle(products)
+        if not force_alert_test:
+            monitor.run_cycle(products)
+            continue
+
+        logger.info(
+            f"[{retailer_key}] FORCE ALERT TEST enabled "
+            f"(max alerts: {force_alert_limit if force_alert_limit > 0 else 'unlimited'})"
+        )
+        sent = 0
+        for idx, product in enumerate(products, 1):
+            name = product.get("name", "Unknown Product")
+            url = (product.get("url") or "").strip()
+            if not url:
+                logger.debug(f"[{retailer_key}] Skipping missing URL: {name}")
+                continue
+
+            logger.info(f"[{retailer_key}] Force alert progress {idx}/{len(products)}: {name}")
+            status = monitor.scrape_product(url)
+            if status is None:
+                logger.warning(f"Failed to scrape: {name} ({url})")
+                continue
+
+            # Force-send only meaningful stock alerts.
+            if status.is_preorder:
+                change_type = "preorder"
+            elif status.in_stock:
+                change_type = "restock"
+            else:
+                logger.debug(f"[{retailer_key}] Skipping forced alert for out-of-stock item: {name}")
+                continue
+
+            change = StockChange(
+                product=product,
+                old_status=None,
+                new_status=status,
+                change_type=change_type,
+            )
+            # db=None bypasses cooldown checks so this can always test webhooks.
+            send_stock_alert(change, db=None)
+            sent += 1
+            if force_alert_limit > 0 and sent >= force_alert_limit:
+                logger.info(f"[{retailer_key}] Reached forced alert limit ({force_alert_limit})")
+                break
 
     logger.info("=== Test cycle complete ===")
 
@@ -123,7 +171,21 @@ def main():
     parser = argparse.ArgumentParser(description="TCG Stock Monitor")
     parser.add_argument("--test", action="store_true", help="Run single check cycle (no loop)")
     parser.add_argument("--retailers", nargs="+", help="Only run specific retailers")
+    parser.add_argument(
+        "--force-alert-test",
+        action="store_true",
+        help="In --test mode, send alerts even when no status change is detected",
+    )
+    parser.add_argument(
+        "--force-alert-limit",
+        type=int,
+        default=1,
+        help="Max forced alerts per retailer in --force-alert-test mode (<=0 means unlimited)",
+    )
     args = parser.parse_args()
+
+    if args.force_alert_test and not args.test:
+        parser.error("--force-alert-test requires --test")
 
     # Initialize database
     db = Database()
@@ -137,7 +199,12 @@ def main():
         import utils.discord as _discord
         _discord.TEST_MODE = True
         logger.info("🧪 TEST MODE — alerts will fire to the test Discord channel")
-        run_test_mode(db, args.retailers)
+        run_test_mode(
+            db,
+            args.retailers,
+            force_alert_test=args.force_alert_test,
+            force_alert_limit=args.force_alert_limit,
+        )
         return
 
     # ─── Start monitor threads ───────────────────────────────────────
@@ -149,6 +216,7 @@ def main():
             continue
 
         products = get_products_by_retailer(retailer_key)
+        products = [p for p in products if isinstance(p.get("url"), str) and p.get("url").strip()]
         if not products:
             logger.info(f"[{retailer_key}] No products configured, skipping")
             continue
@@ -169,7 +237,8 @@ def main():
 
     # Count total products
     total_products = sum(
-        len(get_products_by_retailer(r)) for r in active_retailers
+        len([p for p in get_products_by_retailer(r) if isinstance(p.get("url"), str) and p.get("url").strip()])
+        for r in active_retailers
     )
 
     logger.info("=" * 60)

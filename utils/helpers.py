@@ -43,10 +43,22 @@ def retry_with_backoff(func, max_retries: int = 3, base_delay: float = 2.0):
     """
     Retry a function with exponential backoff.
     Returns the function result, or None if all retries fail.
+    404 errors are not retried — the page simply doesn't exist.
     """
+    import requests as _requests
     for attempt in range(max_retries):
         try:
             return func()
+        except _requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.debug(f"404 — page not found, skipping retries: {e}")
+                return None
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} retries failed: {e}")
+                return None
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
         except Exception as e:
             if attempt == max_retries - 1:
                 logger.error(f"All {max_retries} retries failed: {e}")
@@ -68,11 +80,14 @@ class ProductStatus:
     price: Optional[float] = None
     price_str: Optional[str] = None
     stock_text: Optional[str] = None  # e.g. "In Stock", "Only 3 left", "Pre-order"
+    preorder: Optional[bool] = None
     image_url: Optional[str] = None
     scraped_at: datetime = field(default_factory=datetime.now)
 
     @property
     def is_preorder(self) -> bool:
+        if self.preorder is not None:
+            return bool(self.preorder)
         if self.stock_text:
             return "pre-order" in self.stock_text.lower() or "preorder" in self.stock_text.lower()
         return False
