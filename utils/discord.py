@@ -56,6 +56,7 @@ _CHANGE_COLORS = {
     "price_drop":   0xEB459E,  # pink
     "out_of_stock": 0xED4245,  # red
 }
+_LOW_STOCK_COLOR = 0xF4900C  # orange
 
 # ── Retailer favicon URLs ────────────────────────────────────────────
 _RETAILER_ICONS = {
@@ -88,13 +89,37 @@ def build_restock_embed(change: StockChange) -> dict:
         change.change_type, ("Stock Update", "🟡 Unknown")
     )
 
+    def _strip_scope_suffix(text: str) -> str:
+        return re.sub(
+            r"\s+\((?:Online only|In-store only|Online \+ In-store|Unknown channel)\)\s*$",
+            "",
+            text or "",
+            flags=re.I,
+        ).strip()
+
+    def _is_low_stock_text(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(
+            re.search(r"\bonly\s+\d+\s+left\b", low)
+            or re.search(r"\b\d+\s+left in stock\b", low)
+            or "low stock" in low
+            or "limited stock" in low
+            or "nearly gone" in low
+        )
+
     # Prefer scraped stock text when available (e.g. "Only 2 left in stock.").
-    stock_text = (status.stock_text or "").strip()
+    stock_text = _strip_scope_suffix((status.stock_text or "").strip())
+    is_low_stock = bool(status.in_stock and _is_low_stock_text(stock_text))
+    if is_low_stock:
+        color = _LOW_STOCK_COLOR
+
     if stock_text:
         if change.change_type == "out_of_stock" or not status.in_stock:
             stock_indicator = f"🔴 {stock_text}"
         elif status.is_preorder:
             stock_indicator = f"🔵 {stock_text}"
+        elif is_low_stock:
+            stock_indicator = f"🟠 {stock_text}"
         else:
             stock_indicator = f"🟢 {stock_text}"
 
