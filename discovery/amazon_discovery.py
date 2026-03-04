@@ -9,6 +9,7 @@ Strategy:
   profile (cookies, fingerprints) gives the best results.
 
   - Scrapes search result pages (up to 3 pages per query)
+  - Scrapes selected Amazon Store pages as an additional discovery source
   - Normalises all product URLs to https://www.amazon.com.au/dp/ASIN
     to avoid duplicates from different URL variations
   - Adds random delays between pages to avoid rate limiting
@@ -83,8 +84,6 @@ MAX_PAGES = 3
 # Amazon search URLs per TCG — multiple queries per TCG to catch more products
 AMAZON_SEARCH_URLS: dict[str, list[str]] = {
     "pokemon": [
-        "https://www.amazon.com.au/s?k=pokemon+TCG",
-        "https://www.amazon.com.au/s?k=pokemon+tcg+elite+trainer+box",
     ],
     "one-piece": [
         "https://www.amazon.com.au/s?k=one+piece+trading+card+game+booster+box",
@@ -99,6 +98,18 @@ AMAZON_SEARCH_URLS: dict[str, list[str]] = {
     "lorcana": [
         "https://www.amazon.com.au/s?k=disney+lorcana+trading+card+booster+box",
     ],
+}
+
+# Curated Amazon Store pages to enrich discovery beyond search results.
+# These pages are useful when new listings are not yet indexed in normal search.
+AMAZON_STORE_URLS: dict[str, list[str]] = {
+    "pokemon": [
+        "https://www.amazon.com.au/stores/Pok%C3%A9monTradingCardGame/page/49E55811-7F50-4D13-9DAD-D7D6DCA60918?lp_asin=B0G3CY83L5&ref_=ast_bln",
+    ],
+    "one-piece": [],
+    "mtg": [],
+    "dragon-ball-z": [],
+    "lorcana": [],
 }
 
 
@@ -176,8 +187,88 @@ EXTRACT_JS = """
 }
 """
 
+EXTRACT_STORE_JS = """
+() => {
+    const seen = new Set();
+    const products = [];
+
+    const anchors = Array.from(document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]'));
+
+    anchors.forEach(anchor => {
+        const href = anchor.getAttribute('href') || '';
+        const asinMatch = href.match(/\\/(?:dp|gp\\/product)\\/([A-Z0-9]{10})/i);
+        if (!asinMatch) return;
+
+        const asin = asinMatch[1].toUpperCase();
+        const url = `https://www.amazon.com.au/dp/${asin}`;
+        if (seen.has(url)) return;
+        seen.add(url);
+
+        const card = anchor.closest('article, li, div');
+
+        let name = '';
+        const headingEl = (
+            card && card.querySelector('h1, h2, h3, [aria-label], span')
+        ) || anchor.querySelector('h1, h2, h3, span');
+        if (headingEl) {
+            name = (headingEl.textContent || '').trim();
+        }
+        if (!name) {
+            name = (anchor.getAttribute('aria-label') || '').trim();
+        }
+        if (!name) {
+            const img = (card && card.querySelector('img')) || anchor.querySelector('img');
+            name = ((img && img.getAttribute('alt')) || '').trim();
+        }
+        if (!name) return;
+
+        let priceStr = '';
+        let priceNum = null;
+        const priceEl =
+            (card && card.querySelector('.a-price .a-offscreen')) ||
+            anchor.querySelector('.a-price .a-offscreen');
+        if (priceEl) {
+            const raw = (priceEl.textContent || '').trim();
+            const m = raw.match(/[\\d,]+\\.?\\d*/);
+            if (m) {
+                priceNum = parseFloat(m[0].replace(',', ''));
+                priceStr = '$' + priceNum.toFixed(2);
+            }
+        }
+
+        const imageEl = (card && card.querySelector('img')) || anchor.querySelector('img');
+        const imageUrl = imageEl
+            ? (imageEl.getAttribute('src') || imageEl.getAttribute('data-src') || '')
+            : '';
+
+        products.push({
+            name,
+            url,
+            asin,
+            price: priceStr,
+            price_raw: priceNum,
+            sku: asin,
+            image: imageUrl,
+            is_preorder: name.toLowerCase().includes('pre-order') || name.toLowerCase().includes('coming soon'),
+            is_sponsored: false,
+            promo: '',
+        });
+    });
+
+    return products;
+}
+"""
+
 
 # ─── Playwright Scraping ─────────────────────────────────────────────
+
+def extract_asin_from_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+    match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", url, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).upper()
 
 def scrape_search_page(base_url: str, headed: bool = False) -> list[dict]:
     """
@@ -223,31 +314,6 @@ def scrape_search_page(base_url: str, headed: bool = False) -> list[dict]:
                 page.evaluate(SCROLL_JS)
                 page.wait_for_timeout(1500)
 
-                # ── DEBUG: inspect raw tile structure ──────────────────
-                debug_info = page.evaluate("""
-                () => {
-                    const tiles = document.querySelectorAll('div.s-widget-container[data-csa-c-item-id]');
-                    const samples = [];
-                    tiles.forEach((tile, i) => {
-                        if (i >= 3) return;
-                        const asinEl = tile.querySelector('div[data-asin]');
-                        const nameEl = tile.querySelector('h2.a-size-base-plus span, h2 a span, h2 .a-text-normal');
-                        samples.push({
-                            index: i,
-                            asin: asinEl ? asinEl.getAttribute('data-asin') : '(no div[data-asin])',
-                            name: nameEl ? nameEl.textContent.trim().slice(0, 80) : '(no name el)',
-                            outerSnippet: tile.outerHTML.slice(0, 200),
-                        });
-                    });
-                    return { tileCount: tiles.length, samples };
-                }
-                """)
-                logger.info(f"  [DEBUG] Tiles found: {debug_info['tileCount']}")
-                for s in debug_info['samples']:
-                    logger.info(f"  [DEBUG] Tile {s['index']}: asin={s['asin']!r} name={s['name']!r}")
-                    logger.info(f"  [DEBUG] HTML snippet: {s['outerSnippet']!r}")
-                # ── END DEBUG ─────────────────────────────────────────
-
                 # Extract products
                 products = page.evaluate(EXTRACT_JS)
                 new_count = 0
@@ -280,19 +346,56 @@ def scrape_search_page(base_url: str, headed: bool = False) -> list[dict]:
     return all_products
 
 
+def scrape_store_page(store_url: str, headed: bool = False) -> list[dict]:
+    """
+    Scrape a curated Amazon Store page and extract product links containing ASINs.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.warning("  Playwright not available — cannot scrape Amazon store")
+        return []
+
+    with sync_playwright() as p:
+        context = make_playwright_context(p, headed=headed)
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
+
+        try:
+            mode = "headed" if headed else "headless"
+            logger.info(f"  [{mode}] Store: {store_url[:90]}")
+            page.goto(store_url, wait_until="domcontentloaded", timeout=35_000)
+
+            # Store pages often lazy-load; scroll before extraction.
+            page.evaluate(SCROLL_JS)
+            page.wait_for_timeout(1800)
+
+            products = page.evaluate(EXTRACT_STORE_JS)
+            logger.info(f"  Store extracted: {len(products)} raw products")
+            return products
+        except PlaywrightTimeout:
+            logger.warning("  Store page timeout")
+            return []
+        except Exception as e:
+            logger.warning(f"  Store scraping failed: {e}")
+            return []
+        finally:
+            page.close()
+            context.close()
+
+
 # ─── Product Enrichment ───────────────────────────────────────────────
 
 def enrich_product(raw: dict, tcg: str) -> Optional[dict]:
     name = raw.get("name", "").strip()
     url = raw.get("url", "").strip()
-    asin = raw.get("asin", "").strip()
+    asin = (raw.get("asin", "").strip() or extract_asin_from_url(url) or "")
 
     if not name or not url:
         return None
-    if "amazon.com.au" not in url or "/dp/" not in url:
+    if "amazon.com.au" not in url:
         return None
     if not asin:
         return None
+    url = f"https://www.amazon.com.au/dp/{asin}"
 
     name_lower = name.lower()
 
@@ -347,11 +450,15 @@ def discover_amazon(tcg_filter: Optional[str] = None, dry_run: bool = False,
     all_products: list[dict] = []
     seen_urls: set[str] = set()
 
-    categories = AMAZON_SEARCH_URLS
+    all_tcg_keys = sorted(set(AMAZON_SEARCH_URLS) | set(AMAZON_STORE_URLS))
+    categories = {
+        tcg: {"search": AMAZON_SEARCH_URLS.get(tcg, []), "store": AMAZON_STORE_URLS.get(tcg, [])}
+        for tcg in all_tcg_keys
+    }
     if tcg_filter:
         categories = {k: v for k, v in categories.items() if k == tcg_filter}
         if not categories:
-            logger.error(f"Unknown TCG: {tcg_filter}. Options: {list(AMAZON_SEARCH_URLS)}")
+            logger.error(f"Unknown TCG: {tcg_filter}. Options: {all_tcg_keys}")
             return []
 
     logger.info("🔍 Starting Amazon AU discovery")
@@ -365,8 +472,11 @@ def discover_amazon(tcg_filter: Optional[str] = None, dry_run: bool = False,
         logger.error("   pip install playwright && playwright install chromium")
         return []
 
-    for tcg, search_urls in categories.items():
+    for tcg, sources in categories.items():
         logger.info(f"── {tcg.upper()} ──────────────────────────────")
+
+        search_urls = sources.get("search", [])
+        store_urls = sources.get("store", [])
 
         for search_url in search_urls:
             raw_products = scrape_search_page(search_url, headed=headed)
@@ -380,6 +490,18 @@ def discover_amazon(tcg_filter: Optional[str] = None, dry_run: bool = False,
 
             # Delay between different search queries
             time.sleep(random.uniform(3.0, 5.0))
+
+        for store_url in store_urls:
+            raw_products = scrape_store_page(store_url, headed=headed)
+
+            for raw in raw_products:
+                enriched = enrich_product(raw, tcg)
+                if not enriched or enriched["url"] in seen_urls:
+                    continue
+                seen_urls.add(enriched["url"])
+                all_products.append(enriched)
+
+            time.sleep(random.uniform(2.0, 3.5))
 
     logger.info(f"\n📦 Total unique products after filtering: {len(all_products)}")
 
@@ -406,7 +528,7 @@ def main():
     parser = argparse.ArgumentParser(description="Amazon AU — TCG product discovery")
     parser.add_argument("--dry-run", action="store_true", help="Don't save to DB")
     parser.add_argument("--tcg", default=None,
-                        help=f"TCG to discover. Options: {', '.join(AMAZON_SEARCH_URLS)}")
+                        help=f"TCG to discover. Options: {', '.join(sorted(set(AMAZON_SEARCH_URLS) | set(AMAZON_STORE_URLS)))}")
     parser.add_argument("--no-images", action="store_true", help="Skip image fetching")
     parser.add_argument("--headed", action="store_true",
                         help="Run browser in headed mode. Use on first run to build a trusted cookie session.")

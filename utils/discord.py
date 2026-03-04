@@ -88,6 +88,16 @@ def build_restock_embed(change: StockChange) -> dict:
         change.change_type, ("Stock Update", "🟡 Unknown")
     )
 
+    # Prefer scraped stock text when available (e.g. "Only 2 left in stock.").
+    stock_text = (status.stock_text or "").strip()
+    if stock_text:
+        if change.change_type == "out_of_stock" or not status.in_stock:
+            stock_indicator = f"🔴 {stock_text}"
+        elif status.is_preorder:
+            stock_indicator = f"🔵 {stock_text}"
+        else:
+            stock_indicator = f"🟢 {stock_text}"
+
     # ── Price ───────────────────────────────────────────────────────
     if change.change_type == "price_drop" and change.old_status and change.old_status.price and status.price:
         old = change.old_status.price

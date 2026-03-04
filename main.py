@@ -10,6 +10,7 @@ Usage:
     python main.py              # Run all monitors
     python main.py --test       # Test mode: single check cycle, no loop
     python main.py --retailers amazon_au jbhifi_au   # Run specific retailers only
+    python main.py --test --url https://www.amazon.com.au/dp/B0XXXXXXX
 """
 import argparse
 import logging
@@ -79,6 +80,36 @@ def _is_monitorable_url(url: str) -> bool:
     return True
 
 
+def _infer_retailer_from_url(url: str) -> str | None:
+    if not isinstance(url, str):
+        return None
+    low = url.lower()
+    domain_map = [
+        ("amazon.com.au", "amazon_au"),
+        ("ebgames.com.au", "ebgames_au"),
+        ("jbhifi.com.au", "jbhifi_au"),
+        ("bigw.com.au", "bigw_au"),
+        ("kmart.com.au", "kmart_au"),
+        ("target.com.au", "target_au"),
+    ]
+    for domain, retailer_key in domain_map:
+        if domain in low:
+            return retailer_key
+    return None
+
+
+def _build_manual_test_product(url: str, retailer_key: str) -> dict:
+    """Build a minimal product dict for direct URL test mode."""
+    return {
+        "url": url,
+        "retailer": retailer_key,
+        # Intentionally omit a fixed name so scraper-derived product name is preserved.
+        "set": "general",
+        "tcg": "pokemon",
+        "image": "",
+    }
+
+
 def _infer_forced_change_type(db: Database, product: dict, status) -> str | None:
     """Infer force-alert type with preorder hints from status/product/last DB row."""
     if status.is_preorder:
@@ -144,6 +175,7 @@ def run_test_mode(
     retailers: list[str] = None,
     force_alert_test: bool = False,
     force_alert_limit: int = 1,
+    test_url: str | None = None,
 ):
     """Run a single check cycle for testing (no loop).
     Uses check_product so change detection and Discord alerts fire normally,
@@ -157,6 +189,19 @@ def run_test_mode(
 
         products = get_products_by_retailer(retailer_key)
         products = [p for p in products if _is_monitorable_url(p.get("url", ""))]
+
+        if test_url:
+            match = [
+                p for p in products
+                if (p.get("url") or "").strip().rstrip("/") == test_url.rstrip("/")
+            ]
+            if match:
+                products = match
+                logger.info(f"[{retailer_key}] URL test mode: using configured product for {test_url}")
+            else:
+                products = [_build_manual_test_product(test_url, retailer_key)]
+                logger.info(f"[{retailer_key}] URL test mode: using ad-hoc product for {test_url}")
+
         if not products:
             logger.info(f"[{retailer_key}] No products configured, skipping")
             continue
@@ -213,6 +258,10 @@ def main():
     parser.add_argument("--test", action="store_true", help="Run single check cycle (no loop)")
     parser.add_argument("--retailers", nargs="+", help="Only run specific retailers")
     parser.add_argument(
+        "--url",
+        help="In --test mode, run only this product URL (retailer auto-detected if --retailers omitted)",
+    )
+    parser.add_argument(
         "--force-alert-test",
         action="store_true",
         help="In --test mode, send alerts even when no status change is detected",
@@ -227,6 +276,24 @@ def main():
 
     if args.force_alert_test and not args.test:
         parser.error("--force-alert-test requires --test")
+    if args.url and not args.test:
+        parser.error("--url requires --test")
+
+    if args.url:
+        url = args.url.strip()
+        if not _is_monitorable_url(url):
+            parser.error("--url is empty or not monitorable")
+        args.url = url
+
+        inferred_retailer = _infer_retailer_from_url(url)
+        if not args.retailers:
+            if not inferred_retailer:
+                parser.error("--url retailer could not be inferred; pass --retailers explicitly")
+            args.retailers = [inferred_retailer]
+        elif inferred_retailer and inferred_retailer not in args.retailers:
+            parser.error(
+                f"--url appears to be {inferred_retailer}, but --retailers is {args.retailers}"
+            )
 
     # Initialize database
     db = Database()
@@ -245,6 +312,7 @@ def main():
             args.retailers,
             force_alert_test=args.force_alert_test,
             force_alert_limit=args.force_alert_limit,
+            test_url=args.url,
         )
         return
 
