@@ -22,7 +22,7 @@ import logging
 from typing import Optional
 
 from monitors.base_monitor import BaseMonitor
-from utils.helpers import ProductStatus
+from utils.helpers import ProductStatus, infer_availability_scope_from_text
 from utils.database import Database
 
 logger = logging.getLogger(__name__)
@@ -45,11 +45,8 @@ class AmazonAUMonitor(BaseMonitor):
         if soup is None:
             return None
 
-        # ── Product Title ────────────────────────────────────────────
+        # Static metadata (name/image) is hydrated centrally in BaseMonitor.prepare_status.
         name = "Unknown Product"
-        title_el = soup.find("span", {"id": "productTitle"})
-        if title_el:
-            name = title_el.get_text(strip=True)
 
         # ── Price ────────────────────────────────────────────────────
         price = None
@@ -106,22 +103,11 @@ class AmazonAUMonitor(BaseMonitor):
             if stock_text == "Unknown":
                 stock_text = "In Stock"
 
-        # ── Product Image ────────────────────────────────────────────
         image_url = None
-        img_el = soup.find("img", {"id": "landingImage"})
-        if img_el:
-            # Try data-old-hires first (high res), then src
-            image_url = img_el.get("data-old-hires") or img_el.get("src")
 
-        # Try hiRes from script tags if no image found
-        if not image_url:
-            scripts = soup.find_all("script")
-            for script in scripts:
-                if script.string and "hiRes" in (script.string or ""):
-                    match = re.search(r'"hiRes"\s*:\s*"([^"]+)"', script.string)
-                    if match:
-                        image_url = match.group(1)
-                        break
+        availability_scope = infer_availability_scope_from_text(
+            soup.get_text(" ", strip=True)
+        )
 
         return ProductStatus(
             url=url,
@@ -132,5 +118,6 @@ class AmazonAUMonitor(BaseMonitor):
             price_str=price_str,
             stock_text=stock_text,
             preorder=is_preorder,
+            availability_scope=availability_scope,
             image_url=image_url,
         )

@@ -13,7 +13,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from monitors.base_monitor import BaseMonitor
-from utils.helpers import ProductStatus
+from utils.helpers import ProductStatus, infer_availability_scope_from_text
 from utils.database import Database
 
 logger = logging.getLogger(__name__)
@@ -448,15 +448,8 @@ class JBHiFiAUMonitor(BaseMonitor):
         in_stock = is_preorder or overall_key in ("instock", "limitedavailability")
         is_nearly_gone = _has_nearly_gone_tag(soup, html)
 
-        # ── Product Title ────────────────────────────────────────────
+        # Static metadata (name/image) is hydrated centrally in BaseMonitor.prepare_status.
         name = "Unknown Product"
-        title_el = soup.find("h1")
-        if title_el:
-            name = title_el.get_text(strip=True)
-        else:
-            og_title = soup.find("meta", property="og:title")
-            if og_title:
-                name = og_title.get("content", "Unknown Product")
 
         # ── Price ────────────────────────────────────────────────────
         # JB Hi-Fi uses a stable partial class name: PriceTag_priceTag
@@ -510,11 +503,11 @@ class JBHiFiAUMonitor(BaseMonitor):
         else:
             stock_text = "Unknown"
 
-        # ── Product Image ────────────────────────────────────────────
         image_url = None
-        og_img = soup.find("meta", property="og:image")
-        if og_img:
-            image_url = og_img.get("content")
+
+        availability_scope = infer_availability_scope_from_text(
+            soup.get_text(" ", strip=True)
+        )
 
         return ProductStatus(
             url=url,
@@ -525,5 +518,6 @@ class JBHiFiAUMonitor(BaseMonitor):
             price_str=price_str,
             stock_text=stock_text,
             preorder=is_preorder,
+            availability_scope=availability_scope,
             image_url=image_url,
         )

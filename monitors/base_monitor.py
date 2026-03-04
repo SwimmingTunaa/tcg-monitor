@@ -74,15 +74,11 @@ class BaseMonitor(ABC):
             logger.debug("Playwright not installed — skipping browser fallback")
             return None
 
-        from discovery.base_discovery import STEALTH_JS, BROWSER_PROFILE_DIR, make_playwright_context
-        import os
+        from discovery.base_discovery import STEALTH_JS, make_playwright_context
 
         try:
             with sync_playwright() as p:
-                context = make_playwright_context(
-                    p, headed=headed,
-                    profile_dir=os.path.abspath(BROWSER_PROFILE_DIR),
-                )
+                context = make_playwright_context(p, headed=headed)
                 context.add_init_script(STEALTH_JS)
                 page = context.new_page()
                 try:
@@ -111,6 +107,34 @@ class BaseMonitor(ABC):
         Returns None if the page couldn't be scraped.
         """
         pass
+
+    def prepare_status(self, product: dict, status: ProductStatus) -> ProductStatus:
+        """
+        Hydrate static metadata from config/DB.
+        Dynamic fields (stock/price/channel) remain scraper-sourced.
+        """
+        url = product.get("url", "")
+        last = self.db.get_last_status(url) if url else None
+        canonical = self.db.get_canonical_for_url(url) if url else None
+
+        product_name = (product.get("name") or "").strip()
+        canonical_name = (canonical or {}).get("name")
+        last_name = (last or {}).get("name")
+        if product_name:
+            status.name = product_name
+        elif canonical_name:
+            status.name = canonical_name
+        elif (not status.name) or status.name.lower().startswith("unknown"):
+            if last_name:
+                status.name = last_name
+
+        if not status.image_url:
+            product_image = (product.get("image") or "").strip()
+            canonical_image = ((canonical or {}).get("image") or "").strip()
+            last_image = ((last or {}).get("image_url") or "").strip()
+            status.image_url = product_image or canonical_image or last_image or None
+
+        return status
 
     def detect_change(self, product: dict, new_status: ProductStatus) -> Optional[StockChange]:
         """
@@ -201,6 +225,7 @@ class BaseMonitor(ABC):
         if status is None:
             logger.warning(f"Failed to scrape: {name} ({url})")
             return
+        status = self.prepare_status(product, status)
 
         # Detect changes
         change = self.detect_change(product, status)

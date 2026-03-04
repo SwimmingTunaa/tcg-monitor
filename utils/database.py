@@ -127,6 +127,44 @@ class Database:
         finally:
             conn.close()
 
+    def get_canonical_for_url(self, url: str) -> Optional[dict]:
+        """Get canonical product row linked to a product URL, if matched."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT cp.*
+                FROM product_status ps
+                JOIN canonical_products cp
+                  ON cp.id = ps.canonical_id
+                WHERE ps.url = ?
+                """,
+                (url,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_canonical_release_date_for_url(self, url: str) -> Optional[str]:
+        """Get canonical release_date for a product URL if it is matched."""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT cp.release_date AS release_date
+                FROM product_status ps
+                LEFT JOIN canonical_products cp
+                  ON cp.id = ps.canonical_id
+                WHERE ps.url = ?
+                """,
+                (url,),
+            ).fetchone()
+            if not row:
+                return None
+            return row["release_date"]
+        finally:
+            conn.close()
+
     def update_status(self, url: str, name: str, retailer: str,
                       in_stock: bool, price: Optional[float] = None,
                       price_str: Optional[str] = None,

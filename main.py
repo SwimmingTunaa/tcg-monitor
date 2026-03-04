@@ -13,6 +13,7 @@ Usage:
 """
 import argparse
 import logging
+import re
 import signal
 import sys
 import time
@@ -59,6 +60,48 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+def _has_preorder_hint(text: str) -> bool:
+    return bool(re.search(r"\bpre[\s-]?order\b", text, re.I))
+
+
+def _is_monitorable_url(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    value = url.strip()
+    if not value:
+        return False
+    low = value.lower()
+    # Skip known placeholder URLs that only slow down checks.
+    if "pokemon-tcg-example" in low or "example.com" in low:
+        return False
+    return True
+
+
+def _infer_forced_change_type(db: Database, product: dict, status) -> str | None:
+    """Infer force-alert type with preorder hints from status/product/last DB row."""
+    if status.is_preorder:
+        return "preorder"
+
+    hints = []
+    if isinstance(status.stock_text, str):
+        hints.append(status.stock_text)
+    name = product.get("name")
+    if isinstance(name, str):
+        hints.append(name)
+
+    # For blocked fallback statuses, inspect last known stock_text as a hint.
+    if isinstance(status.stock_text, str) and "blocked" in status.stock_text.lower():
+        last = db.get_last_status(status.url)
+        if last and isinstance(last.get("stock_text"), str):
+            hints.append(last["stock_text"])
+
+    if any(_has_preorder_hint(h) for h in hints):
+        return "preorder"
+    if status.in_stock:
+        return "restock"
+    return None
 
 
 def monitor_loop(monitor, products: list[dict]):
@@ -113,7 +156,7 @@ def run_test_mode(
             continue
 
         products = get_products_by_retailer(retailer_key)
-        products = [p for p in products if isinstance(p.get("url"), str) and p.get("url").strip()]
+        products = [p for p in products if _is_monitorable_url(p.get("url", ""))]
         if not products:
             logger.info(f"[{retailer_key}] No products configured, skipping")
             continue
@@ -141,13 +184,11 @@ def run_test_mode(
             if status is None:
                 logger.warning(f"Failed to scrape: {name} ({url})")
                 continue
+            status = monitor.prepare_status(product, status)
 
             # Force-send only meaningful stock alerts.
-            if status.is_preorder:
-                change_type = "preorder"
-            elif status.in_stock:
-                change_type = "restock"
-            else:
+            change_type = _infer_forced_change_type(db, product, status)
+            if change_type is None:
                 logger.debug(f"[{retailer_key}] Skipping forced alert for out-of-stock item: {name}")
                 continue
 
@@ -216,7 +257,7 @@ def main():
             continue
 
         products = get_products_by_retailer(retailer_key)
-        products = [p for p in products if isinstance(p.get("url"), str) and p.get("url").strip()]
+        products = [p for p in products if _is_monitorable_url(p.get("url", ""))]
         if not products:
             logger.info(f"[{retailer_key}] No products configured, skipping")
             continue
@@ -237,7 +278,7 @@ def main():
 
     # Count total products
     total_products = sum(
-        len([p for p in get_products_by_retailer(r) if isinstance(p.get("url"), str) and p.get("url").strip()])
+        len([p for p in get_products_by_retailer(r) if _is_monitorable_url(p.get("url", ""))])
         for r in active_retailers
     )
 

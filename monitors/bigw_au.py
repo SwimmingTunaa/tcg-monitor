@@ -11,7 +11,7 @@ import logging
 from typing import Optional
 
 from monitors.base_monitor import BaseMonitor
-from utils.helpers import ProductStatus
+from utils.helpers import ProductStatus, infer_availability_scope_from_text
 from utils.database import Database
 
 logger = logging.getLogger(__name__)
@@ -49,11 +49,8 @@ class BigWAUMonitor(BaseMonitor):
         # Try structured data first (most reliable)
         ld = self._try_json_ld(soup)
 
-        # ── Product Title ────────────────────────────────────────────
-        name = ld.get("name", "")
-        if not name:
-            title_el = soup.find("h1")
-            name = title_el.get_text(strip=True) if title_el else "Unknown Product"
+        # Static metadata (name/image) is hydrated centrally in BaseMonitor.prepare_status.
+        name = "Unknown Product"
 
         # ── Price ────────────────────────────────────────────────────
         price = None
@@ -113,14 +110,11 @@ class BigWAUMonitor(BaseMonitor):
                 in_stock = False
                 stock_text = "Out of Stock"
 
-        # ── Product Image ────────────────────────────────────────────
-        image_url = ld.get("image", None)
-        if isinstance(image_url, list):
-            image_url = image_url[0] if image_url else None
-        if not image_url:
-            og_img = soup.find("meta", property="og:image")
-            if og_img:
-                image_url = og_img.get("content")
+        image_url = None
+
+        availability_scope = infer_availability_scope_from_text(
+            soup.get_text(" ", strip=True)
+        )
 
         return ProductStatus(
             url=url,
@@ -131,5 +125,6 @@ class BigWAUMonitor(BaseMonitor):
             price_str=price_str,
             stock_text=stock_text,
             preorder=is_preorder,
+            availability_scope=availability_scope,
             image_url=image_url,
         )

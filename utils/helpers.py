@@ -4,11 +4,19 @@ Shared utilities for the TCG Stock Monitor.
 import random
 import time
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+AVAILABILITY_SCOPES = {
+    "online",
+    "instore_only",
+    "both",
+    "unknown",
+}
 
 # ─── User Agent Rotation ────────────────────────────────────────────
 USER_AGENTS = [
@@ -69,6 +77,54 @@ def retry_with_backoff(func, max_retries: int = 3, base_delay: float = 2.0):
     return None
 
 
+def normalize_availability_scope(scope: Optional[str]) -> str:
+    if not scope:
+        return "unknown"
+    key = re.sub(r"[^a-z_]", "", str(scope).lower())
+    if key in AVAILABILITY_SCOPES:
+        return key
+    return "unknown"
+
+
+def infer_availability_scope_from_text(text: str) -> str:
+    low = (text or "").lower()
+    # Normalize separators so variants like "Online only" or "In-Store only" are matched.
+    low = re.sub(r"[\u00a0\u2000-\u200b]", " ", low)
+    low = re.sub(r"[-_/]+", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+
+    has_online_only = bool(re.search(r"\bonline\s+only\b", low))
+    has_instore_only = bool(
+        re.search(r"\bin\s*store\s+only\b", low) or re.search(r"\binstore\s+only\b", low)
+    )
+
+    if has_online_only and has_instore_only:
+        return "both"
+    if has_online_only:
+        return "online"
+    if has_instore_only:
+        return "instore_only"
+    return "unknown"
+
+
+def availability_scope_label(scope: Optional[str]) -> str:
+    key = normalize_availability_scope(scope)
+    return {
+        "online": "Online only",
+        "instore_only": "In-store only",
+        "both": "Online + In-store",
+        "unknown": "Unknown channel",
+    }[key]
+
+
+def append_availability_scope(stock_text: Optional[str], scope: Optional[str]) -> str:
+    base = (stock_text or "Unknown").strip() or "Unknown"
+    label = availability_scope_label(scope)
+    if label.lower() in base.lower():
+        return base
+    return f"{base} ({label})"
+
+
 # ─── Data Models ─────────────────────────────────────────────────────
 @dataclass
 class ProductStatus:
@@ -81,8 +137,13 @@ class ProductStatus:
     price_str: Optional[str] = None
     stock_text: Optional[str] = None  # e.g. "In Stock", "Only 3 left", "Pre-order"
     preorder: Optional[bool] = None
+    availability_scope: str = "unknown"  # online | instore_only | both | unknown
     image_url: Optional[str] = None
     scraped_at: datetime = field(default_factory=datetime.now)
+
+    def __post_init__(self):
+        self.availability_scope = normalize_availability_scope(self.availability_scope)
+        self.stock_text = append_availability_scope(self.stock_text, self.availability_scope)
 
     @property
     def is_preorder(self) -> bool:

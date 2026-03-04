@@ -18,7 +18,7 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 from monitors.base_monitor import BaseMonitor
-from utils.helpers import ProductStatus
+from utils.helpers import ProductStatus, infer_availability_scope_from_text
 from utils.database import Database
 
 logger = logging.getLogger(__name__)
@@ -53,11 +53,8 @@ class EBGamesAUMonitor(BaseMonitor):
         Works on soup from either raw HTTP or Playwright.
         """
 
-        # ── Title ────────────────────────────────────────────────────
+        # Static metadata (name/image) is hydrated centrally in BaseMonitor.prepare_status.
         name = "Unknown Product"
-        title_el = soup.find("h1", itemprop="name") or soup.find("h1")
-        if title_el:
-            name = title_el.get_text(strip=True)
 
         # ── Price ────────────────────────────────────────────────────
         # EB Games embeds the price in itemprop="price" content attribute
@@ -106,19 +103,11 @@ class EBGamesAUMonitor(BaseMonitor):
             in_stock = False
             stock_text = "Out of Stock"
 
-        # ── Image ────────────────────────────────────────────────────
         image_url: Optional[str] = None
-        # First non-skeleton gallery image
-        img_el = soup.select_one("#product-media-gallery img.gallery-img:not(.skeleton-loader)")
-        if img_el:
-            src = img_el.get("src", "")
-            if src and not src.startswith("data:"):
-                image_url = "https:" + src if src.startswith("//") else src
-        if not image_url:
-            og_img = soup.find("meta", property="og:image:url") or soup.find("meta", property="og:image")
-            if og_img:
-                src = og_img.get("content", "")
-                image_url = "https:" + src if src.startswith("//") else src
+
+        availability_scope = infer_availability_scope_from_text(
+            soup.get_text(" ", strip=True)
+        )
 
         return ProductStatus(
             url=url,
@@ -129,6 +118,7 @@ class EBGamesAUMonitor(BaseMonitor):
             price_str=price_str,
             stock_text=stock_text,
             preorder=(is_preorder_schema or is_preorder_btn),
+            availability_scope=availability_scope,
             image_url=image_url,
         )
 

@@ -245,20 +245,54 @@ def make_playwright_context(p, headed: bool = False, profile_dir: Optional[str] 
     close the context when done.
     """
     if profile_dir is None:
-        profile_dir = os.path.abspath(BROWSER_PROFILE_DIR)
-    os.makedirs(profile_dir, exist_ok=True)
+        profile_dir = os.getenv("PLAYWRIGHT_PROFILE_DIR", "").strip() or BROWSER_PROFILE_DIR
+    profile_dir = os.path.abspath(profile_dir)
+    profile_name = os.getenv("PLAYWRIGHT_PROFILE_NAME", "").strip()
 
-    return p.chromium.launch_persistent_context(
+    # If caller passed a concrete Chrome profile dir (e.g. .../Chrome/Default),
+    # Playwright expects user_data_dir to be the parent and profile selected by arg.
+    base_name = os.path.basename(profile_dir)
+    if (
+        not profile_name
+        and (
+            base_name == "Default"
+            or base_name.startswith("Profile ")
+            or base_name.startswith("Guest Profile")
+        )
+    ):
+        profile_name = base_name
+        profile_dir = os.path.dirname(profile_dir)
+
+    os.makedirs(profile_dir, exist_ok=True)
+    channel = os.getenv("PLAYWRIGHT_BROWSER_CHANNEL", "").strip() or None
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+    ]
+    if profile_name:
+        launch_args.append(f"--profile-directory={profile_name}")
+    kwargs = dict(
         user_data_dir=profile_dir,
         headless=not headed,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-        ],
+        args=launch_args,
         user_agent=REQUEST_HEADERS["User-Agent"],
         locale="en-AU",
         viewport={"width": 1280, "height": 900},
     )
+    if channel:
+        kwargs["channel"] = channel
+
+    try:
+        return p.chromium.launch_persistent_context(**kwargs)
+    except Exception:
+        # If requested browser channel isn't available, retry with bundled Chromium.
+        if channel:
+            logger.warning(
+                f"Playwright channel '{channel}' unavailable; retrying with bundled Chromium."
+            )
+            kwargs.pop("channel", None)
+            return p.chromium.launch_persistent_context(**kwargs)
+        raise
 
 
 # ─── Utility Functions ────────────────────────────────────────────────

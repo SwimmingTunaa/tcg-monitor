@@ -8,6 +8,7 @@ Sends alerts to:
 """
 import requests
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -18,7 +19,7 @@ from config.webhooks import (
 from config.settings import TEST_MODE
 from utils.helpers import (
     ProductStatus, StockChange,
-    RETAILER_NAMES, SET_DISPLAY_NAMES,
+    RETAILER_NAMES, SET_DISPLAY_NAMES, availability_scope_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,12 @@ def build_restock_embed(change: StockChange) -> dict:
     preorder_date = None
     if status.stock_text and "—" in status.stock_text:
         preorder_date = status.stock_text.split("—", 1)[1].strip()
+        preorder_date = re.sub(
+            r"\s+\((?:Online only|In-store only|Online \+ In-store|Unknown channel)\)\s*$",
+            "",
+            preorder_date,
+            flags=re.I,
+        )
 
     # ── Product title (with [TEST] prefix if needed) ──────────────────────
     product_title = f"[TEST] {status.name}" if TEST_MODE else status.name
@@ -118,6 +125,7 @@ def build_restock_embed(change: StockChange) -> dict:
         {"name": "Type",     "value": type_label,       "inline": True},
         {"name": "Set",      "value": set_display,      "inline": True},
         {"name": "Stock",    "value": stock_indicator,  "inline": True},
+        {"name": "Channel",  "value": availability_scope_label(status.availability_scope), "inline": True},
         {"name": "Retailer", "value": retailer_name,    "inline": True},
     ]
     if preorder_date:
